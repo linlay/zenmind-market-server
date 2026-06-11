@@ -8,7 +8,7 @@ services:
       MARKET_ADDR: :8088
       MARKET_DB_PATH: /data/market.db
       MARKET_ARTIFACT_ROOT: /data/artifacts
-      MARKET_PUBLIC_BASE_URL: ${MARKET_PUBLIC_BASE_URL:-https://zenmind.cc/market}
+      MARKET_PUBLIC_BASE_URL: ${MARKET_PUBLIC_BASE_URL:-https://market.zenmind.cc}
       MARKET_ADMIN_TOKEN: ${MARKET_ADMIN_TOKEN:-}
       MARKET_PROXY_TOKEN: ${MARKET_PROXY_TOKEN:-}
       MARKET_MAX_UPLOAD_BYTES: ${MARKET_MAX_UPLOAD_BYTES:-536870912}

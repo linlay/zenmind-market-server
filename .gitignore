@@ -1,6 +1,6 @@
 .DS_Store
 data/
-market-server
+/market-server
 coverage.out
 
 .env

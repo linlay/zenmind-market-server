@@ -27,7 +27,7 @@ The server loads `.env` from the current working directory before building its r
 | `MARKET_ADDR` | `:8088` | HTTP listen address. |
 | `MARKET_DB_PATH` | `data/market.db` | SQLite database path. |
 | `MARKET_ARTIFACT_ROOT` | `data/artifacts` | Local artifact storage directory. |
-| `MARKET_PUBLIC_BASE_URL` | `http://localhost:8088` | Public base URL used when generating artifact URLs. |
+| `MARKET_PUBLIC_BASE_URL` | `http://localhost:8088` | Public base URL used when generating artifact URLs. Use `https://market.zenmind.cc` in production. |
 | `MARKET_ADMIN_TOKEN` | empty | Bearer token required for admin APIs. |
 | `MARKET_PROXY_TOKEN` | empty | Trusted proxy header token. |
 | `MARKET_MAX_UPLOAD_BYTES` | `536870912` | Maximum upload size in bytes. |
