@@ -18,6 +18,7 @@ services:
       zenmind-official-net:
         aliases:
           - zenmind-market-server
+    restart: unless-stopped
 
 networks:
   zenmind-official-net:
