@@ -1,0 +1,24 @@
+services:
+  market-server:
+    build:
+      context: .
+    image: zenmind-market-server
+    container_name: zenmind-market-server
+    environment:
+      MARKET_ADDR: :8088
+      MARKET_DB_PATH: /data/market.db
+      MARKET_ARTIFACT_ROOT: /data/artifacts
+      MARKET_PUBLIC_BASE_URL: ${MARKET_PUBLIC_BASE_URL:-https://zenmind.cc/market}
+      MARKET_ADMIN_TOKEN: ${MARKET_ADMIN_TOKEN:-}
+      MARKET_PROXY_TOKEN: ${MARKET_PROXY_TOKEN:-}
+      MARKET_MAX_UPLOAD_BYTES: ${MARKET_MAX_UPLOAD_BYTES:-536870912}
+    volumes:
+      - ./data:/data
+    networks:
+      zenmind-official-net:
+        aliases:
+          - zenmind-market-server
+
+networks:
+  zenmind-official-net:
+    external: true

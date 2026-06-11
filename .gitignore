@@ -1,0 +1,8 @@
+.DS_Store
+data/
+market-server
+coverage.out
+
+.env
+.env.*
+!.env.example
