@@ -1,0 +1,35 @@
+# ZenMind Market Server
+
+Official-curated marketplace API for ZenMind skills, plugins, and sandbox environment templates.
+
+## Development
+
+```bash
+cp .env.example .env
+go test ./...
+go run ./cmd/market-server
+```
+
+Default paths:
+
+- database: `data/market.db`
+- artifacts: `data/artifacts`
+- listen address: `:8088`
+
+Admin APIs accept either `Authorization: Bearer $MARKET_ADMIN_TOKEN` or trusted official proxy headers with `X-ZenMind-Market-Proxy-Token: $MARKET_PROXY_TOKEN`.
+
+## Environment
+
+The server loads `.env` from the current working directory before building its runtime config. Existing shell variables win over values in `.env`.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MARKET_ADDR` | `:8088` | HTTP listen address. |
+| `MARKET_DB_PATH` | `data/market.db` | SQLite database path. |
+| `MARKET_ARTIFACT_ROOT` | `data/artifacts` | Local artifact storage directory. |
+| `MARKET_PUBLIC_BASE_URL` | `http://localhost:8088` | Public base URL used when generating artifact URLs. |
+| `MARKET_ADMIN_TOKEN` | empty | Bearer token required for admin APIs. |
+| `MARKET_PROXY_TOKEN` | empty | Trusted proxy header token. |
+| `MARKET_MAX_UPLOAD_BYTES` | `536870912` | Maximum upload size in bytes. |
+# zenmind-market-server
+# zenmind-market-server
