@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -88,46 +87,4 @@ func envInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	return parsed
-}
-
-func loadDotEnv(path string) error {
-	content, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	for lineNumber, rawLine := range strings.Split(string(content), "\n") {
-		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		line = strings.TrimPrefix(line, "export ")
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			return fmt.Errorf("%s:%d: expected KEY=VALUE", path, lineNumber+1)
-		}
-		key = strings.TrimSpace(key)
-		if key == "" {
-			return fmt.Errorf("%s:%d: empty key", path, lineNumber+1)
-		}
-		if _, exists := os.LookupEnv(key); exists {
-			continue
-		}
-		if err := os.Setenv(key, unquoteDotEnvValue(strings.TrimSpace(value))); err != nil {
-			return fmt.Errorf("%s:%d: %w", path, lineNumber+1, err)
-		}
-	}
-	return nil
-}
-
-func unquoteDotEnvValue(value string) string {
-	if len(value) < 2 {
-		return value
-	}
-	if (value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'') {
-		return value[1 : len(value)-1]
-	}
-	return value
 }
