@@ -12,8 +12,14 @@ func npmPackageName(itemType ItemType, id string) string {
 		return "@zenmind-skill/" + id
 	case TypePlugin:
 		return "@zenmind-plugin/" + id
-	case TypeSandbox:
+	case TypeSandboxImage:
 		return "@zenmind-sandbox/" + id
+	case TypePet:
+		return "@zenmind-pet/" + id
+	case TypeCLITool:
+		return "@zenmind-cli/" + id
+	case TypeWebsiteApp:
+		return "@zenmind-website-app/" + id
 	default:
 		return "@zenmind/" + id
 	}
@@ -32,7 +38,13 @@ func parseNpmPackageName(name string) (ItemType, string, error) {
 	case "@zenmind-plugin":
 		return TypePlugin, id, nil
 	case "@zenmind-sandbox":
-		return TypeSandbox, id, nil
+		return TypeSandboxImage, id, nil
+	case "@zenmind-pet":
+		return TypePet, id, nil
+	case "@zenmind-cli":
+		return TypeCLITool, id, nil
+	case "@zenmind-website-app":
+		return TypeWebsiteApp, id, nil
 	default:
 		return "", "", fmt.Errorf("unsupported package scope %q", parts[0])
 	}

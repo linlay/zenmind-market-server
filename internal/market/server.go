@@ -41,11 +41,31 @@ func (a *App) Close() error {
 func (a *App) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.handleHealth)
+	mux.HandleFunc("GET /api/v1/markets", a.handleMarkets)
 	mux.HandleFunc("GET /api/v1/catalog", a.handleCatalog)
 	mux.HandleFunc("GET /api/v1/desktop/catalog", a.handleDesktopCatalog)
 	mux.HandleFunc("GET /api/v1/items/{type}/{id}", a.handleItem)
-	mux.HandleFunc("GET /api/v1/skills", a.handleSkills)
-	mux.HandleFunc("GET /api/v1/skills/{name}/download", a.handleSkillDownload)
+	for _, route := range marketRouteDefinitions() {
+		route := route
+		mux.HandleFunc("GET /api/v1/"+route.Path, func(w http.ResponseWriter, r *http.Request) {
+			a.handleMarketList(w, r, route.Type)
+		})
+		mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}", func(w http.ResponseWriter, r *http.Request) {
+			a.handleMarketItem(w, r, route.Type)
+		})
+		mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}/versions", func(w http.ResponseWriter, r *http.Request) {
+			a.handleMarketVersions(w, r, route.Type)
+		})
+		mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}/resolve", func(w http.ResponseWriter, r *http.Request) {
+			a.handleMarketResolve(w, r, route.Type)
+		})
+		mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}/download", func(w http.ResponseWriter, r *http.Request) {
+			a.handleMarketDownload(w, r, route.Type)
+		})
+		mux.HandleFunc("POST /api/v1/admin/"+route.Path+"/publish", a.requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+			a.handleTypedPublish(w, r, route.Type)
+		}))
+	}
 	mux.HandleFunc("POST /api/v1/admin/publish", a.requireAdmin(a.handlePublish))
 	mux.HandleFunc("POST /api/v1/admin/unpublish", a.requireAdmin(a.handleUnpublish))
 	mux.HandleFunc("/npm/", a.handleNPM)
@@ -57,8 +77,20 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (a *App) handleMarkets(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, MarketsResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC(), Markets: marketInfos()})
+}
+
 func (a *App) handleCatalog(w http.ResponseWriter, r *http.Request) {
-	itemType, _ := normalizeItemType(r.URL.Query().Get("type"))
+	var itemType ItemType
+	if rawType := strings.TrimSpace(r.URL.Query().Get("type")); rawType != "" {
+		normalized, err := normalizeItemType(rawType)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
+			return
+		}
+		itemType = normalized
+	}
 	items, err := a.store.ListPublic(r.Context(), itemType)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
@@ -87,7 +119,13 @@ func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
 			Tags:              public.Tags,
 			MinDesktopVersion: public.MinDesktopVersion,
 			SandboxKind:       public.SandboxKind,
+			WebsiteKind:       public.WebsiteKind,
 			Assets:            public.Assets,
+			Dependencies:      public.Dependencies,
+			Metadata:          public.Metadata,
+			Install:           public.Install,
+			Uninstall:         public.Uninstall,
+			Detect:            public.Detect,
 		})
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -111,44 +149,112 @@ func (a *App) handleItem(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, publicItem(item))
 }
 
-func (a *App) handleSkills(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleMarketList(w http.ResponseWriter, r *http.Request, itemType ItemType) {
 	page := intQuery(r, "page", 1)
 	limit := intQuery(r, "limit", 100)
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	items, err := a.store.ListPublic(r.Context(), TypeSkill)
+	items, err := a.store.ListPublic(r.Context(), itemType)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	total := len(items)
-	start := (page - 1) * limit
-	if start > total {
-		start = total
-	}
-	end := start + limit
-	if end > total {
-		end = total
-	}
-	data := make([]SkillAPIItem, 0, end-start)
-	for _, item := range items[start:end] {
-		data = append(data, SkillAPIItem{
-			Name:          item.ID,
-			DisplayName:   item.Name,
-			Description:   item.Description,
-			LatestVersion: item.LatestVersion,
-			Tags:          item.Tags,
-		})
-	}
-	writeJSON(w, http.StatusOK, SkillAPIResponse{Success: true, Data: data, Pagination: Pagination{Page: page, Limit: limit, Total: total}})
+	result := publicItems(items)
+	sortPublicItems(result)
+	total := len(result)
+	start, end := pageWindow(page, limit, total)
+	writeJSON(w, http.StatusOK, MarketItemsResponse{
+		SchemaVersion: 1,
+		Market:        string(itemType),
+		GeneratedAt:   time.Now().UTC(),
+		Items:         result[start:end],
+		Pagination:    Pagination{Page: page, Limit: limit, Total: total},
+	})
 }
 
-func (a *App) handleSkillDownload(w http.ResponseWriter, r *http.Request) {
-	a.downloadArtifact(w, r, TypeSkill, sanitizeSlug(r.PathValue("name")), r.URL.Query().Get("version"), r.URL.Query().Get("platform"))
+func (a *App) handleMarketItem(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	item, err := a.store.GetPublic(r.Context(), itemType, sanitizeSlug(r.PathValue("id")))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, publicItem(item))
+}
+
+func (a *App) handleMarketVersions(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	id := sanitizeSlug(r.PathValue("id"))
+	item, err := a.store.GetPublic(r.Context(), itemType, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	versions, err := a.store.ListVersions(r.Context(), itemType, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, VersionsResponse{SchemaVersion: 1, Item: publicItem(item), Versions: versions})
+}
+
+func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	id := sanitizeSlug(r.PathValue("id"))
+	item, err := a.store.GetPublic(r.Context(), itemType, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	version := strings.TrimSpace(r.URL.Query().Get("version"))
+	if version == "" {
+		version = item.LatestVersion
+	}
+	platform := strings.TrimSpace(r.URL.Query().Get("platform"))
+	artifact, err := a.store.GetArtifact(r.Context(), itemType, id, version, platform)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusOK, ResolveResponse{SchemaVersion: 1, Item: publicItem(item), Version: version, Platform: platform})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	asset := PublicAsset{
+		URL:         artifact.URL,
+		SHA256:      artifact.SHA256,
+		Integrity:   artifact.Integrity,
+		SizeBytes:   artifact.SizeBytes,
+		ArchiveType: artifact.ArchiveType,
+		Platform:    artifact.PlatformKey,
+		Role:        artifact.AssetRole,
+	}
+	writeJSON(w, http.StatusOK, ResolveResponse{SchemaVersion: 1, Item: publicItem(item), Version: artifact.Version, Platform: artifact.PlatformKey, Asset: &asset})
+}
+
+func (a *App) handleMarketDownload(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	a.downloadArtifact(w, r, itemType, sanitizeSlug(r.PathValue("id")), r.URL.Query().Get("version"), r.URL.Query().Get("platform"))
 }
 
 func (a *App) handlePublish(w http.ResponseWriter, r *http.Request) {
+	a.handlePublishWithType(w, r, "")
+}
+
+func (a *App) handleTypedPublish(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	a.handlePublishWithType(w, r, itemType)
+}
+
+func (a *App) handlePublishWithType(w http.ResponseWriter, r *http.Request, forcedType ItemType) {
 	var req PublishRequest
 	var artifact *storedArtifact
 	contentType := r.Header.Get("content-type")
@@ -160,6 +266,10 @@ func (a *App) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.Unmarshal([]byte(r.FormValue("metadata")), &req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
+			return
+		}
+		if err := forcePublishType(&req, forcedType); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
 			return
 		}
 		if err := validatePublishRequest(&req); err != nil {
@@ -180,10 +290,18 @@ func (a *App) handlePublish(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 			return
 		}
+		if err := forcePublishType(&req, forcedType); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
+			return
+		}
 		if err := validatePublishRequest(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
 			return
 		}
+	}
+	if err := validateArtifactRequirement(req, artifact != nil); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_artifact", err.Error())
+		return
 	}
 	if err := a.store.Publish(r.Context(), req, artifact); err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
@@ -264,7 +382,7 @@ func (a *App) downloadArtifact(w http.ResponseWriter, r *http.Request, itemType 
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	a.store.RecordDownload(r.Context(), itemType, id, version, artifact.PlatformKey, r.UserAgent(), requestIP(r))
+	a.store.RecordDownload(r.Context(), itemType, id, artifact.Version, artifact.PlatformKey, r.UserAgent(), requestIP(r))
 	http.Redirect(w, r, artifact.URL, http.StatusFound)
 }
 
@@ -300,6 +418,86 @@ func intQuery(r *http.Request, key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func pageWindow(page, limit, total int) (int, int) {
+	start := (page - 1) * limit
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	return start, end
+}
+
+func forcePublishType(req *PublishRequest, forcedType ItemType) error {
+	if forcedType == "" {
+		return nil
+	}
+	if strings.TrimSpace(string(req.Type)) == "" {
+		req.Type = forcedType
+		return nil
+	}
+	itemType, err := normalizeItemType(string(req.Type))
+	if err != nil {
+		return err
+	}
+	if itemType != forcedType {
+		return errors.New("publish type does not match endpoint")
+	}
+	req.Type = forcedType
+	return nil
+}
+
+type marketRoute struct {
+	Type ItemType
+	Path string
+}
+
+func marketRouteDefinitions() []marketRoute {
+	return []marketRoute{
+		{Type: TypeSkill, Path: "skills"},
+		{Type: TypePlugin, Path: "plugins"},
+		{Type: TypeSandboxImage, Path: "sandbox-images"},
+		{Type: TypePet, Path: "pets"},
+		{Type: TypeCLITool, Path: "cli-tools"},
+		{Type: TypeWebsiteApp, Path: "website-apps"},
+	}
+}
+
+func marketInfos() []MarketInfo {
+	archiveTypes := map[ItemType][]string{
+		TypeSkill:        {"tar.gz", "zip", "skill", "md"},
+		TypePlugin:       {"tar.gz", "zip"},
+		TypeSandboxImage: {"sandbox-template", "container-image", "tar.gz", "zip"},
+		TypePet:          {"pet", "zip"},
+		TypeCLITool:      {"tar.gz", "zip"},
+		TypeWebsiteApp:   {"website-app", "zip", "tar.gz"},
+	}
+	names := map[ItemType]string{
+		TypeSkill:        "Skill Market",
+		TypePlugin:       "Plugin Market",
+		TypeSandboxImage: "Sandbox Image Market",
+		TypePet:          "Pet Market",
+		TypeCLITool:      "CLI Tool Market",
+		TypeWebsiteApp:   "Website App Market",
+	}
+	routes := marketRouteDefinitions()
+	result := make([]MarketInfo, 0, len(routes))
+	for _, route := range routes {
+		result = append(result, MarketInfo{
+			Type:                  string(route.Type),
+			Route:                 "/api/v1/" + route.Path,
+			Name:                  names[route.Type],
+			DesktopManagedInstall: route.Type != TypeCLITool,
+			AllowsMarketScripts:   route.Type == TypeCLITool,
+			ArchiveTypes:          archiveTypes[route.Type],
+			DependencyKinds:       allowedDependencyKinds[route.Type],
+		})
+	}
+	return result
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

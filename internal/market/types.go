@@ -15,24 +15,53 @@ type Config struct {
 type ItemType string
 
 const (
-	TypeSkill   ItemType = "skill"
-	TypePlugin  ItemType = "plugin"
-	TypeSandbox ItemType = "sandbox"
+	TypeSkill        ItemType = "skill"
+	TypePlugin       ItemType = "plugin"
+	TypeSandboxImage ItemType = "sandbox-image"
+	TypePet          ItemType = "pet"
+	TypeCLITool      ItemType = "cli-tool"
+	TypeWebsiteApp   ItemType = "website-app"
+)
+
+const (
+	DependencyBuiltinService    = "builtin-service"
+	DependencyPlugin            = "plugin"
+	DependencySkill             = "skill"
+	DependencySandboxImage      = "sandbox-image"
+	DependencyCLITool           = "cli-tool"
+	DependencySystemCommand     = "system-command"
+	DependencySystemRuntime     = "system-runtime"
+	DependencyDesktopCapability = "desktop-capability"
+	DependencyPhaseInstall      = "install"
+	DependencyPhasePostInstall  = "postInstall"
+	DependencyPhaseRuntime      = "runtime"
+	DependencyPhaseOptional     = "optional"
+	AssetRolePrimary            = "primary"
+	SandboxKindEnvironment      = "environment-template"
+	SandboxKindContainerImage   = "container-image"
+	WebsiteKindExternal         = "external"
+	WebsiteKindLocalApp         = "local-app"
 )
 
 type PublishRequest struct {
-	Type              ItemType          `json:"type"`
-	ID                string            `json:"id"`
-	Name              string            `json:"name"`
-	Version           string            `json:"version"`
-	Description       string            `json:"description"`
-	Readme            string            `json:"readme"`
-	Tags              []string          `json:"tags"`
-	MinDesktopVersion string            `json:"minDesktopVersion"`
-	SandboxKind       string            `json:"sandboxKind"`
-	PlatformKey       string            `json:"platformKey"`
-	ArchiveType       string            `json:"archiveType"`
-	Metadata          map[string]string `json:"metadata"`
+	Type              ItemType           `json:"type"`
+	ID                string             `json:"id"`
+	Name              string             `json:"name"`
+	Version           string             `json:"version"`
+	Description       string             `json:"description"`
+	Readme            string             `json:"readme"`
+	Tags              []string           `json:"tags"`
+	MinDesktopVersion string             `json:"minDesktopVersion"`
+	SandboxKind       string             `json:"sandboxKind"`
+	WebsiteKind       string             `json:"websiteKind"`
+	PlatformKey       string             `json:"platformKey"`
+	AssetRole         string             `json:"assetRole"`
+	ArchiveType       string             `json:"archiveType"`
+	Metadata          map[string]string  `json:"metadata"`
+	Dependencies      []MarketDependency `json:"dependencies"`
+	Install           *MarketScriptSpec  `json:"install"`
+	Uninstall         *MarketScriptSpec  `json:"uninstall"`
+	Detect            *MarketDetectSpec  `json:"detect"`
 }
 
 type PublicAsset struct {
@@ -42,6 +71,33 @@ type PublicAsset struct {
 	SizeBytes   int64  `json:"sizeBytes"`
 	ArchiveType string `json:"archiveType"`
 	Platform    string `json:"platform,omitempty"`
+	Role        string `json:"role,omitempty"`
+}
+
+type MarketDependency struct {
+	Kind        string `json:"kind"`
+	Phase       string `json:"phase"`
+	Required    bool   `json:"required"`
+	ID          string `json:"id,omitempty"`
+	ServiceID   string `json:"serviceId,omitempty"`
+	Command     string `json:"command,omitempty"`
+	Runtime     string `json:"runtime,omitempty"`
+	Capability  string `json:"capability,omitempty"`
+	Version     string `json:"version,omitempty"`
+	DisplayName string `json:"displayName,omitempty"`
+	InstallHint string `json:"installHint,omitempty"`
+}
+
+type MarketScriptSpec struct {
+	Command   string `json:"command,omitempty"`
+	ScriptURL string `json:"scriptUrl,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	Integrity string `json:"integrity,omitempty"`
+}
+
+type MarketDetectSpec struct {
+	Commands       []string `json:"commands,omitempty"`
+	VersionCommand string   `json:"versionCommand,omitempty"`
 }
 
 type PublicItem struct {
@@ -54,8 +110,14 @@ type PublicItem struct {
 	Tags              []string               `json:"tags"`
 	MinDesktopVersion string                 `json:"minDesktopVersion,omitempty"`
 	SandboxKind       string                 `json:"sandboxKind,omitempty"`
+	WebsiteKind       string                 `json:"websiteKind,omitempty"`
 	NpmPackage        string                 `json:"npmPackage"`
 	Assets            map[string]PublicAsset `json:"assets"`
+	Dependencies      []MarketDependency     `json:"dependencies"`
+	Metadata          map[string]string      `json:"metadata,omitempty"`
+	Install           *MarketScriptSpec      `json:"install,omitempty"`
+	Uninstall         *MarketScriptSpec      `json:"uninstall,omitempty"`
+	Detect            *MarketDetectSpec      `json:"detect,omitempty"`
 	PublishedAt       time.Time              `json:"publishedAt"`
 	UpdatedAt         time.Time              `json:"updatedAt"`
 }
@@ -66,18 +128,28 @@ type CatalogResponse struct {
 	Items         []PublicItem `json:"items"`
 }
 
-type SkillAPIItem struct {
-	Name          string   `json:"name"`
-	DisplayName   string   `json:"display_name"`
-	Description   string   `json:"description"`
-	LatestVersion string   `json:"latest_version"`
-	Tags          []string `json:"tags"`
+type MarketInfo struct {
+	Type                  string   `json:"type"`
+	Route                 string   `json:"route"`
+	Name                  string   `json:"name"`
+	DesktopManagedInstall bool     `json:"desktopManagedInstall"`
+	AllowsMarketScripts   bool     `json:"allowsMarketScripts"`
+	ArchiveTypes          []string `json:"archiveTypes"`
+	DependencyKinds       []string `json:"dependencyKinds"`
 }
 
-type SkillAPIResponse struct {
-	Success    bool           `json:"success"`
-	Data       []SkillAPIItem `json:"data"`
-	Pagination Pagination     `json:"pagination"`
+type MarketsResponse struct {
+	SchemaVersion int          `json:"schemaVersion"`
+	GeneratedAt   time.Time    `json:"generatedAt"`
+	Markets       []MarketInfo `json:"markets"`
+}
+
+type MarketItemsResponse struct {
+	SchemaVersion int          `json:"schemaVersion"`
+	Market        string       `json:"market"`
+	GeneratedAt   time.Time    `json:"generatedAt"`
+	Items         []PublicItem `json:"items"`
+	Pagination    Pagination   `json:"pagination"`
 }
 
 type Pagination struct {
@@ -95,13 +167,43 @@ type DesktopCatalogItem struct {
 	Tags              []string               `json:"tags"`
 	MinDesktopVersion string                 `json:"minDesktopVersion,omitempty"`
 	SandboxKind       string                 `json:"sandboxKind,omitempty"`
+	WebsiteKind       string                 `json:"websiteKind,omitempty"`
 	Assets            map[string]PublicAsset `json:"assets"`
+	Dependencies      []MarketDependency     `json:"dependencies"`
+	Metadata          map[string]string      `json:"metadata,omitempty"`
+	Install           *MarketScriptSpec      `json:"install,omitempty"`
+	Uninstall         *MarketScriptSpec      `json:"uninstall,omitempty"`
+	Detect            *MarketDetectSpec      `json:"detect,omitempty"`
 }
 
 type DesktopCatalogResponse struct {
 	SchemaVersion int                  `json:"schemaVersion"`
 	GeneratedAt   time.Time            `json:"generatedAt"`
 	Items         []DesktopCatalogItem `json:"items"`
+}
+
+type PublicVersion struct {
+	Version      string                 `json:"version"`
+	Description  string                 `json:"description"`
+	Readme       string                 `json:"readme,omitempty"`
+	Dependencies []MarketDependency     `json:"dependencies"`
+	Metadata     map[string]string      `json:"metadata,omitempty"`
+	Assets       map[string]PublicAsset `json:"assets"`
+	PublishedAt  time.Time              `json:"publishedAt"`
+}
+
+type VersionsResponse struct {
+	SchemaVersion int             `json:"schemaVersion"`
+	Item          PublicItem      `json:"item"`
+	Versions      []PublicVersion `json:"versions"`
+}
+
+type ResolveResponse struct {
+	SchemaVersion int          `json:"schemaVersion"`
+	Item          PublicItem   `json:"item"`
+	Version       string       `json:"version"`
+	Platform      string       `json:"platform,omitempty"`
+	Asset         *PublicAsset `json:"asset,omitempty"`
 }
 
 type storedItem struct {
@@ -113,9 +215,15 @@ type storedItem struct {
 	LatestVersion     string
 	MinDesktopVersion string
 	SandboxKind       string
+	WebsiteKind       string
 	Published         bool
 	PublishedAt       time.Time
 	UpdatedAt         time.Time
 	Tags              []string
 	Assets            map[string]PublicAsset
+	Dependencies      []MarketDependency
+	Metadata          map[string]string
+	Install           *MarketScriptSpec
+	Uninstall         *MarketScriptSpec
+	Detect            *MarketDetectSpec
 }

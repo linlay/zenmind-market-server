@@ -20,7 +20,9 @@ import (
 )
 
 type storedArtifact struct {
+	Version     string
 	PlatformKey string
+	AssetRole   string
 	ArchiveType string
 	Path        string
 	URL         string
@@ -53,9 +55,30 @@ func validatePublishRequest(req *PublishRequest) error {
 	if req.PlatformKey == "" {
 		req.PlatformKey = "universal"
 	}
-	req.ArchiveType = normalizeArchiveType(req.ArchiveType, req.Type)
-	if req.SandboxKind == "" && req.Type == TypeSandbox {
-		req.SandboxKind = "environment-template"
+	req.AssetRole = sanitizePlatform(req.AssetRole)
+	if req.AssetRole == "" {
+		req.AssetRole = AssetRolePrimary
+	}
+	req.SandboxKind = strings.TrimSpace(req.SandboxKind)
+	req.WebsiteKind = strings.TrimSpace(req.WebsiteKind)
+	if req.SandboxKind == "" && req.Type == TypeSandboxImage {
+		req.SandboxKind = SandboxKindEnvironment
+	}
+	if req.WebsiteKind == "" && req.Type == TypeWebsiteApp {
+		req.WebsiteKind = WebsiteKindExternal
+	}
+	req.ArchiveType = normalizeArchiveType(req.ArchiveType, req.Type, req.SandboxKind, req.WebsiteKind)
+	if req.Metadata == nil {
+		req.Metadata = map[string]string{}
+	}
+	if req.Dependencies == nil {
+		req.Dependencies = []MarketDependency{}
+	}
+	if err := normalizeDependencies(req.Type, req.Dependencies); err != nil {
+		return err
+	}
+	if err := validatePublishProtocol(req); err != nil {
+		return err
 	}
 	return nil
 }
@@ -99,7 +122,9 @@ func saveAndValidateArtifact(root, publicBaseURL string, req PublishRequest, fil
 		return nil, err
 	}
 	return &storedArtifact{
+		Version:     req.Version,
 		PlatformKey: req.PlatformKey,
+		AssetRole:   req.AssetRole,
 		ArchiveType: req.ArchiveType,
 		Path:        target,
 		URL:         strings.TrimRight(publicBaseURL, "/") + "/artifacts/" + filepath.ToSlash(relative),
@@ -110,38 +135,65 @@ func saveAndValidateArtifact(root, publicBaseURL string, req PublishRequest, fil
 }
 
 func validateArtifactByType(filePath string, req PublishRequest) error {
-	switch req.Type {
-	case TypeSkill:
-		if req.ArchiveType == "md" {
-			return nil
-		}
-		if found, err := archiveContains(filePath, req.ArchiveType, "SKILL.md"); err != nil {
-			return err
-		} else if !found {
-			return errors.New("skill artifact must contain SKILL.md")
-		}
-	case TypePlugin:
-		content, err := archiveFileContent(filePath, req.ArchiveType, "manifest.json")
-		if err != nil {
-			return err
-		}
-		if len(content) == 0 {
-			return errors.New("plugin artifact must contain manifest.json")
-		}
-		var manifest struct {
-			ID   string `json:"id"`
-			Kind string `json:"kind"`
-		}
-		if err := json.Unmarshal(content, &manifest); err != nil {
-			return fmt.Errorf("plugin manifest is invalid JSON: %w", err)
-		}
-		if manifest.Kind != "plugin" {
-			return errors.New("plugin manifest must declare kind=plugin")
-		}
-		if manifest.ID != "" && sanitizeSlug(manifest.ID) != req.ID {
-			return fmt.Errorf("plugin manifest id mismatch: expected %s, got %s", req.ID, manifest.ID)
-		}
-	case TypeSandbox:
+	validator, ok := artifactValidators[req.Type]
+	if !ok {
+		return fmt.Errorf("unsupported item type %q", req.Type)
+	}
+	return validator(filePath, req)
+}
+
+var artifactValidators = map[ItemType]func(string, PublishRequest) error{
+	TypeSkill:        validateSkillArtifact,
+	TypePlugin:       validatePluginArtifact,
+	TypeSandboxImage: validateSandboxImageArtifact,
+	TypePet:          validatePetArtifact,
+	TypeCLITool:      validateCLIToolArtifact,
+	TypeWebsiteApp:   validateWebsiteAppArtifact,
+}
+
+func validateSkillArtifact(filePath string, req PublishRequest) error {
+	if req.ArchiveType == "md" {
+		return nil
+	}
+	if found, err := archiveContains(filePath, req.ArchiveType, "SKILL.md"); err != nil {
+		return err
+	} else if !found {
+		return errors.New("skill artifact must contain SKILL.md")
+	}
+	return nil
+}
+
+func validatePluginArtifact(filePath string, req PublishRequest) error {
+	content, err := archiveFileContent(filePath, req.ArchiveType, "manifest.json")
+	if err != nil {
+		return err
+	}
+	if len(content) == 0 {
+		return errors.New("plugin artifact must contain manifest.json")
+	}
+	var manifest struct {
+		ID      string `json:"id"`
+		Kind    string `json:"kind"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		return fmt.Errorf("plugin manifest is invalid JSON: %w", err)
+	}
+	if manifest.Kind != "plugin" {
+		return errors.New("plugin manifest must declare kind=plugin")
+	}
+	if manifest.ID == "" || sanitizeSlug(manifest.ID) != req.ID {
+		return fmt.Errorf("plugin manifest id mismatch: expected %s, got %s", req.ID, manifest.ID)
+	}
+	if strings.TrimSpace(manifest.Version) != "" && strings.TrimSpace(manifest.Version) != req.Version {
+		return fmt.Errorf("plugin manifest version mismatch: expected %s, got %s", req.Version, manifest.Version)
+	}
+	return nil
+}
+
+func validateSandboxImageArtifact(filePath string, req PublishRequest) error {
+	switch req.SandboxKind {
+	case SandboxKindEnvironment:
 		content, err := archiveFileContent(filePath, req.ArchiveType, "environment.json")
 		if err != nil {
 			return err
@@ -163,8 +215,240 @@ func validateArtifactByType(filePath string, req PublishRequest) error {
 		if strings.TrimSpace(environment.ImageRepository) == "" || strings.TrimSpace(environment.ImageTag) == "" {
 			return errors.New("sandbox environment.json must declare image_repository and image_tag")
 		}
+		return nil
+	case SandboxKindContainerImage:
+		return validateSafeArchive(filePath, req.ArchiveType)
+	default:
+		return fmt.Errorf("unsupported sandboxKind %q", req.SandboxKind)
+	}
+}
+
+func validatePetArtifact(filePath string, req PublishRequest) error {
+	content, err := archiveFileContent(filePath, req.ArchiveType, "pet.json")
+	if err != nil {
+		return err
+	}
+	if len(content) == 0 {
+		return errors.New("pet artifact must contain pet.json")
+	}
+	if found, err := archiveContains(filePath, req.ArchiveType, "pet-idle.png"); err != nil {
+		return err
+	} else if !found {
+		return errors.New("pet artifact must contain pet-idle.png")
+	}
+	var manifest struct {
+		ID      string `json:"id"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		return fmt.Errorf("pet.json is invalid JSON: %w", err)
+	}
+	if manifest.ID != "" && sanitizeSlug(manifest.ID) != req.ID {
+		return fmt.Errorf("pet manifest id mismatch: expected %s, got %s", req.ID, manifest.ID)
+	}
+	if strings.TrimSpace(manifest.Version) != "" && strings.TrimSpace(manifest.Version) != req.Version {
+		return fmt.Errorf("pet manifest version mismatch: expected %s, got %s", req.Version, manifest.Version)
 	}
 	return nil
+}
+
+func validateCLIToolArtifact(filePath string, req PublishRequest) error {
+	return validateSafeArchive(filePath, req.ArchiveType)
+}
+
+func validateWebsiteAppArtifact(filePath string, req PublishRequest) error {
+	if req.WebsiteKind == WebsiteKindExternal {
+		return validateSafeArchive(filePath, req.ArchiveType)
+	}
+	if req.WebsiteKind != WebsiteKindLocalApp {
+		return fmt.Errorf("unsupported websiteKind %q", req.WebsiteKind)
+	}
+	content, err := archiveFileContent(filePath, req.ArchiveType, "website.json")
+	if err != nil {
+		return err
+	}
+	if len(content) == 0 {
+		return errors.New("local website app artifact must contain website.json")
+	}
+	var manifest struct {
+		ID      string `json:"id"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		return fmt.Errorf("website.json is invalid JSON: %w", err)
+	}
+	if manifest.ID != "" && sanitizeSlug(manifest.ID) != req.ID {
+		return fmt.Errorf("website manifest id mismatch: expected %s, got %s", req.ID, manifest.ID)
+	}
+	if strings.TrimSpace(manifest.Version) != "" && strings.TrimSpace(manifest.Version) != req.Version {
+		return fmt.Errorf("website manifest version mismatch: expected %s, got %s", req.Version, manifest.Version)
+	}
+	return nil
+}
+
+func validateSafeArchive(filePath, archiveType string) error {
+	_, err := archiveFileContent(filePath, archiveType, "__zenmind_missing_validation_probe__")
+	return err
+}
+
+func validateArtifactRequirement(req PublishRequest, hasArtifact bool) error {
+	required := map[ItemType]bool{
+		TypeSkill:        true,
+		TypePlugin:       true,
+		TypeSandboxImage: true,
+		TypePet:          true,
+	}
+	if req.Type == TypeWebsiteApp && req.WebsiteKind == WebsiteKindLocalApp {
+		required[TypeWebsiteApp] = true
+	}
+	if required[req.Type] && !hasArtifact {
+		return fmt.Errorf("%s publish requires an artifact package", req.Type)
+	}
+	if req.Type == TypeWebsiteApp && req.WebsiteKind == WebsiteKindExternal && strings.TrimSpace(req.Metadata["url"]) == "" && strings.TrimSpace(req.Metadata["entryUrl"]) == "" {
+		return errors.New("external website-app publish requires metadata.url or metadata.entryUrl")
+	}
+	return nil
+}
+
+func normalizeDependencies(itemType ItemType, dependencies []MarketDependency) error {
+	for index := range dependencies {
+		dep := &dependencies[index]
+		dep.Kind = strings.TrimSpace(dep.Kind)
+		dep.Phase = strings.TrimSpace(dep.Phase)
+		if dep.Phase == "" {
+			dep.Phase = DependencyPhaseRuntime
+		}
+		if !validDependencyKind(dep.Kind) {
+			return fmt.Errorf("dependency[%d] has unsupported kind %q", index, dep.Kind)
+		}
+		if !validDependencyPhase(dep.Phase) {
+			return fmt.Errorf("dependency[%d] has unsupported phase %q", index, dep.Phase)
+		}
+		if dep.Required && dep.Phase == DependencyPhaseOptional {
+			return fmt.Errorf("dependency[%d] cannot be required with optional phase", index)
+		}
+		if !dependencyAllowedForType(itemType, dep.Kind) {
+			return fmt.Errorf("%s cannot depend on %s", itemType, dep.Kind)
+		}
+		dep.ID = sanitizeOptionalID(dep.ID)
+		dep.ServiceID = sanitizeOptionalID(dep.ServiceID)
+		dep.Command = strings.TrimSpace(dep.Command)
+		dep.Runtime = strings.TrimSpace(dep.Runtime)
+		dep.Capability = strings.TrimSpace(dep.Capability)
+		dep.Version = strings.TrimSpace(dep.Version)
+		dep.DisplayName = strings.TrimSpace(dep.DisplayName)
+		dep.InstallHint = strings.TrimSpace(dep.InstallHint)
+	}
+	return nil
+}
+
+func validDependencyKind(kind string) bool {
+	switch kind {
+	case DependencyBuiltinService, DependencyPlugin, DependencySkill, DependencySandboxImage, DependencyCLITool, DependencySystemCommand, DependencySystemRuntime, DependencyDesktopCapability:
+		return true
+	default:
+		return false
+	}
+}
+
+func validDependencyPhase(phase string) bool {
+	switch phase {
+	case DependencyPhaseInstall, DependencyPhasePostInstall, DependencyPhaseRuntime, DependencyPhaseOptional:
+		return true
+	default:
+		return false
+	}
+}
+
+func dependencyAllowedForType(itemType ItemType, kind string) bool {
+	allowed := allowedDependencyKinds[itemType]
+	for _, candidate := range allowed {
+		if candidate == kind {
+			return true
+		}
+	}
+	return false
+}
+
+var allowedDependencyKinds = map[ItemType][]string{
+	TypeSkill: {
+		DependencyBuiltinService,
+		DependencySandboxImage,
+		DependencyCLITool,
+		DependencySystemCommand,
+		DependencySystemRuntime,
+		DependencyDesktopCapability,
+	},
+	TypePlugin: {
+		DependencyBuiltinService,
+		DependencyPlugin,
+		DependencyCLITool,
+		DependencySystemCommand,
+		DependencySystemRuntime,
+		DependencyDesktopCapability,
+	},
+	TypeSandboxImage: {
+		DependencyBuiltinService,
+		DependencySystemCommand,
+		DependencySystemRuntime,
+		DependencyDesktopCapability,
+	},
+	TypePet: {
+		DependencyBuiltinService,
+		DependencyDesktopCapability,
+	},
+	TypeCLITool: {
+		DependencyBuiltinService,
+		DependencyCLITool,
+		DependencySystemCommand,
+		DependencySystemRuntime,
+		DependencyDesktopCapability,
+	},
+	TypeWebsiteApp: {
+		DependencyBuiltinService,
+		DependencyPlugin,
+		DependencyCLITool,
+		DependencySystemCommand,
+		DependencySystemRuntime,
+		DependencyDesktopCapability,
+	},
+}
+
+func validatePublishProtocol(req *PublishRequest) error {
+	if req.Type != TypeCLITool && (scriptSpecHasContent(req.Install) || scriptSpecHasContent(req.Uninstall)) {
+		return fmt.Errorf("%s does not allow market-level install or uninstall scripts", req.Type)
+	}
+	if req.Type == TypeCLITool {
+		if err := validateScriptSpec("install", req.Install); err != nil {
+			return err
+		}
+		if err := validateScriptSpec("uninstall", req.Uninstall); err != nil {
+			return err
+		}
+		return nil
+	}
+	if req.Detect != nil && (len(req.Detect.Commands) > 0 || strings.TrimSpace(req.Detect.VersionCommand) != "") {
+		return fmt.Errorf("%s does not support market-level detect commands", req.Type)
+	}
+	return nil
+}
+
+func validateScriptSpec(label string, spec *MarketScriptSpec) error {
+	if spec == nil {
+		return nil
+	}
+	spec.Command = strings.TrimSpace(spec.Command)
+	spec.ScriptURL = strings.TrimSpace(spec.ScriptURL)
+	spec.SHA256 = strings.TrimSpace(spec.SHA256)
+	spec.Integrity = strings.TrimSpace(spec.Integrity)
+	if spec.ScriptURL != "" && spec.SHA256 == "" && spec.Integrity == "" {
+		return fmt.Errorf("%s.scriptUrl requires sha256 or integrity", label)
+	}
+	return nil
+}
+
+func scriptSpecHasContent(spec *MarketScriptSpec) bool {
+	return spec != nil && (strings.TrimSpace(spec.Command) != "" || strings.TrimSpace(spec.ScriptURL) != "" || strings.TrimSpace(spec.SHA256) != "" || strings.TrimSpace(spec.Integrity) != "")
 }
 
 func archiveContains(filePath, archiveType, basename string) (bool, error) {
@@ -202,7 +486,7 @@ func archiveFileContent(filePath, archiveType, basename string) ([]byte, error) 
 	}
 	defer raw.Close()
 	var stream io.Reader = raw
-	if archiveType == "tar.gz" || archiveType == "sandbox-template" || strings.HasSuffix(lower, ".gz") || strings.HasSuffix(lower, ".tgz") {
+	if archiveType == "tar.gz" || archiveType == "sandbox-template" || archiveType == "pet" || archiveType == "website-app" || strings.HasSuffix(lower, ".gz") || strings.HasSuffix(lower, ".tgz") {
 		gzipReader, err := gzip.NewReader(raw)
 		if err != nil {
 			return nil, err
@@ -262,10 +546,20 @@ func sanitizeSlug(value string) string {
 	value = strings.TrimPrefix(value, "@zenmind-skill/")
 	value = strings.TrimPrefix(value, "@zenmind-plugin/")
 	value = strings.TrimPrefix(value, "@zenmind-sandbox/")
+	value = strings.TrimPrefix(value, "@zenmind-pet/")
+	value = strings.TrimPrefix(value, "@zenmind-cli/")
+	value = strings.TrimPrefix(value, "@zenmind-website-app/")
 	value = strings.ReplaceAll(value, " ", "-")
 	value = regexp.MustCompile(`[^a-z0-9._-]+`).ReplaceAllString(value, "-")
 	value = strings.Trim(value, "-")
 	return value
+}
+
+func sanitizeOptionalID(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return sanitizeSlug(value)
 }
 
 func sanitizePlatform(value string) string {
@@ -276,20 +570,32 @@ func sanitizePlatform(value string) string {
 	return value
 }
 
-func normalizeArchiveType(value string, itemType ItemType) string {
+func normalizeArchiveType(value string, itemType ItemType, sandboxKind, websiteKind string) string {
 	value = strings.TrimSpace(strings.ToLower(value))
 	switch value {
-	case "tar.gz", "tgz", "zip", "skill", "md", "sandbox-template":
+	case "tar.gz", "tgz", "zip", "skill", "md", "sandbox-template", "container-image", "pet", "website-app":
 		if value == "tgz" {
 			return "tar.gz"
 		}
 		return value
 	}
-	if itemType == TypeSandbox {
+	if itemType == TypeSandboxImage {
+		if sandboxKind == SandboxKindContainerImage {
+			return "container-image"
+		}
 		return "sandbox-template"
 	}
 	if itemType == TypeSkill {
 		return "tar.gz"
+	}
+	if itemType == TypePet {
+		return "pet"
+	}
+	if itemType == TypeWebsiteApp {
+		if websiteKind == WebsiteKindExternal {
+			return "tar.gz"
+		}
+		return "website-app"
 	}
 	return "tar.gz"
 }
@@ -307,6 +613,12 @@ func artifactExtension(archiveType, filename string) string {
 		if strings.HasSuffix(lower, ".zip") {
 			return ".zip"
 		}
+		return ".tar.gz"
+	case "container-image":
+		return ".tar"
+	case "pet":
+		return ".tar.gz"
+	case "website-app":
 		return ".tar.gz"
 	default:
 		return ".tar.gz"
