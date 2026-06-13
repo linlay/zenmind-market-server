@@ -145,6 +145,7 @@ func validateArtifactByType(filePath string, req PublishRequest) error {
 var artifactValidators = map[ItemType]func(string, PublishRequest) error{
 	TypeSkill:        validateSkillArtifact,
 	TypePlugin:       validatePluginArtifact,
+	TypeAgent:        validateAgentArtifact,
 	TypeSandboxImage: validateSandboxImageArtifact,
 	TypePet:          validatePetArtifact,
 	TypeCLITool:      validateCLIToolArtifact,
@@ -189,6 +190,20 @@ func validatePluginArtifact(filePath string, req PublishRequest) error {
 		return fmt.Errorf("plugin manifest version mismatch: expected %s, got %s", req.Version, manifest.Version)
 	}
 	return nil
+}
+
+func validateAgentArtifact(filePath string, req PublishRequest) error {
+	if found, err := archiveContains(filePath, req.ArchiveType, "agent.yml"); err != nil {
+		return err
+	} else if found {
+		return nil
+	}
+	if found, err := archiveContains(filePath, req.ArchiveType, "agent.yaml"); err != nil {
+		return err
+	} else if found {
+		return nil
+	}
+	return errors.New("agent artifact must contain agent.yml or agent.yaml")
 }
 
 func validateSandboxImageArtifact(filePath string, req PublishRequest) error {
@@ -295,6 +310,7 @@ func validateArtifactRequirement(req PublishRequest, hasArtifact bool) error {
 	required := map[ItemType]bool{
 		TypeSkill:        true,
 		TypePlugin:       true,
+		TypeAgent:        true,
 		TypeSandboxImage: true,
 		TypePet:          true,
 	}
@@ -382,6 +398,16 @@ var allowedDependencyKinds = map[ItemType][]string{
 	TypePlugin: {
 		DependencyBuiltinService,
 		DependencyPlugin,
+		DependencyCLITool,
+		DependencySystemCommand,
+		DependencySystemRuntime,
+		DependencyDesktopCapability,
+	},
+	TypeAgent: {
+		DependencyBuiltinService,
+		DependencyPlugin,
+		DependencySkill,
+		DependencySandboxImage,
 		DependencyCLITool,
 		DependencySystemCommand,
 		DependencySystemRuntime,
@@ -486,7 +512,7 @@ func archiveFileContent(filePath, archiveType, basename string) ([]byte, error) 
 	}
 	defer raw.Close()
 	var stream io.Reader = raw
-	if archiveType == "tar.gz" || archiveType == "sandbox-template" || archiveType == "pet" || archiveType == "website-app" || strings.HasSuffix(lower, ".gz") || strings.HasSuffix(lower, ".tgz") {
+	if archiveType == "tar.gz" || archiveType == "agent" || archiveType == "sandbox-template" || archiveType == "pet" || archiveType == "website-app" || strings.HasSuffix(lower, ".gz") || strings.HasSuffix(lower, ".tgz") {
 		gzipReader, err := gzip.NewReader(raw)
 		if err != nil {
 			return nil, err
@@ -545,6 +571,7 @@ func sanitizeSlug(value string) string {
 	value = strings.TrimSpace(strings.ToLower(value))
 	value = strings.TrimPrefix(value, "@zenmind-skill/")
 	value = strings.TrimPrefix(value, "@zenmind-plugin/")
+	value = strings.TrimPrefix(value, "@zenmind-agent/")
 	value = strings.TrimPrefix(value, "@zenmind-sandbox/")
 	value = strings.TrimPrefix(value, "@zenmind-pet/")
 	value = strings.TrimPrefix(value, "@zenmind-cli/")
@@ -573,7 +600,7 @@ func sanitizePlatform(value string) string {
 func normalizeArchiveType(value string, itemType ItemType, sandboxKind, websiteKind string) string {
 	value = strings.TrimSpace(strings.ToLower(value))
 	switch value {
-	case "tar.gz", "tgz", "zip", "skill", "md", "sandbox-template", "container-image", "pet", "website-app":
+	case "tar.gz", "tgz", "zip", "skill", "md", "agent", "sandbox-template", "container-image", "pet", "website-app":
 		if value == "tgz" {
 			return "tar.gz"
 		}
@@ -587,6 +614,9 @@ func normalizeArchiveType(value string, itemType ItemType, sandboxKind, websiteK
 	}
 	if itemType == TypeSkill {
 		return "tar.gz"
+	}
+	if itemType == TypeAgent {
+		return "agent"
 	}
 	if itemType == TypePet {
 		return "pet"
@@ -617,6 +647,8 @@ func artifactExtension(archiveType, filename string) string {
 	case "container-image":
 		return ".tar"
 	case "pet":
+		return ".tar.gz"
+	case "agent":
 		return ".tar.gz"
 	case "website-app":
 		return ".tar.gz"

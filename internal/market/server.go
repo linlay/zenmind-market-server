@@ -452,17 +452,20 @@ func forcePublishType(req *PublishRequest, forcedType ItemType) error {
 }
 
 type marketRoute struct {
-	Type ItemType
-	Path string
+	Type          ItemType
+	Path          string
+	IncludeInInfo bool
 }
 
 func marketRouteDefinitions() []marketRoute {
 	return []marketRoute{
-		{Type: TypeSkill, Path: "skills"},
-		{Type: TypePlugin, Path: "plugins"},
-		{Type: TypeSandboxImage, Path: "sandbox-images"},
-		{Type: TypePet, Path: "pets"},
-		{Type: TypeCLITool, Path: "cli-tools"},
+		{Type: TypeSkill, Path: "skills", IncludeInInfo: true},
+		{Type: TypePlugin, Path: "plugins", IncludeInInfo: true},
+		{Type: TypeAgent, Path: "agents", IncludeInInfo: true},
+		{Type: TypeSandboxImage, Path: "sandbox-images", IncludeInInfo: true},
+		{Type: TypePet, Path: "pets", IncludeInInfo: true},
+		{Type: TypeCLITool, Path: "cli-tools", IncludeInInfo: true},
+		{Type: TypeWebsiteApp, Path: "webapps", IncludeInInfo: true},
 		{Type: TypeWebsiteApp, Path: "website-apps"},
 	}
 }
@@ -471,6 +474,7 @@ func marketInfos() []MarketInfo {
 	archiveTypes := map[ItemType][]string{
 		TypeSkill:        {"tar.gz", "zip", "skill", "md"},
 		TypePlugin:       {"tar.gz", "zip"},
+		TypeAgent:        {"agent", "tar.gz", "zip"},
 		TypeSandboxImage: {"sandbox-template", "container-image", "tar.gz", "zip"},
 		TypePet:          {"pet", "zip"},
 		TypeCLITool:      {"tar.gz", "zip"},
@@ -479,14 +483,18 @@ func marketInfos() []MarketInfo {
 	names := map[ItemType]string{
 		TypeSkill:        "Skill Market",
 		TypePlugin:       "Plugin Market",
+		TypeAgent:        "Agents Market",
 		TypeSandboxImage: "Sandbox Image Market",
 		TypePet:          "Pet Market",
 		TypeCLITool:      "CLI Tool Market",
-		TypeWebsiteApp:   "Website App Market",
+		TypeWebsiteApp:   "WebApps Market",
 	}
 	routes := marketRouteDefinitions()
 	result := make([]MarketInfo, 0, len(routes))
 	for _, route := range routes {
+		if !route.IncludeInInfo {
+			continue
+		}
 		result = append(result, MarketInfo{
 			Type:                  string(route.Type),
 			Route:                 "/api/v1/" + route.Path,

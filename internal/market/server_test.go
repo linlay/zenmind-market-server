@@ -69,8 +69,8 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &markets); err != nil {
 		t.Fatalf("decode markets: %v", err)
 	}
-	if len(markets.Markets) != 6 {
-		t.Fatalf("market count = %d, want 6: %+v", len(markets.Markets), markets.Markets)
+	if len(markets.Markets) != 7 {
+		t.Fatalf("market count = %d, want 7: %+v", len(markets.Markets), markets.Markets)
 	}
 
 	rec = httptest.NewRecorder()
@@ -147,6 +147,7 @@ func TestNpmPackument(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
 	publishMultipart(t, handler, PublishRequest{Type: TypeSkill, ID: "demo", Name: "Demo", Version: "1.0.0", ArchiveType: "tar.gz"}, tarGz(t, map[string]string{"demo/SKILL.md": "# Demo\n"}))
+	publishMultipart(t, handler, PublishRequest{Type: TypeAgent, ID: "assistant", Name: "Assistant", Version: "1.0.0", ArchiveType: "agent"}, tarGz(t, map[string]string{"assistant/agent.yml": "name: Assistant\n"}))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/npm/@zenmind-skill/demo", nil)
@@ -156,6 +157,16 @@ func TestNpmPackument(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"latest":"1.0.0"`) || !strings.Contains(rec.Body.String(), `"@zenmind-skill/demo"`) {
 		t.Fatalf("unexpected packument: %s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/npm/@zenmind-agent/assistant", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("agent npm status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"@zenmind-agent/assistant"`) {
+		t.Fatalf("unexpected agent packument: %s", rec.Body.String())
 	}
 }
 
@@ -196,7 +207,7 @@ func TestSandboxTemplateValidation(t *testing.T) {
 	}
 }
 
-func TestSixMarketTypesPublishListResolveAndDownload(t *testing.T) {
+func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
 
@@ -232,6 +243,25 @@ func TestSixMarketTypesPublishListResolveAndDownload(t *testing.T) {
 				ArchiveType: "tar.gz",
 			},
 			archive: tarGz(t, map[string]string{"plugin/manifest.json": `{"kind":"plugin","id":"shared-id","version":"1.0.0","scripts":{"deploy":"./deploy.sh","start":"./start.sh","stop":"./stop.sh"}}`}),
+		},
+		{
+			path:     "agents",
+			itemType: TypeAgent,
+			id:       "planner",
+			req: PublishRequest{
+				ID:          "planner",
+				Name:        "Planner Agent",
+				Version:     "1.0.0",
+				Description: "Task planning agent",
+				ArchiveType: "agent",
+				Dependencies: []MarketDependency{{
+					Kind:      DependencyBuiltinService,
+					Phase:     DependencyPhaseRuntime,
+					Required:  true,
+					ServiceID: "agent-platform",
+				}},
+			},
+			archive: tarGz(t, map[string]string{"planner/agent.yml": "name: Planner\n"}),
 		},
 		{
 			path:     "sandbox-images",
@@ -281,7 +311,7 @@ func TestSixMarketTypesPublishListResolveAndDownload(t *testing.T) {
 			archive: tarGz(t, map[string]string{"bin/zmctl": "#!/bin/sh\n"}),
 		},
 		{
-			path:     "website-apps",
+			path:     "webapps",
 			itemType: TypeWebsiteApp,
 			id:       "docs",
 			req: PublishRequest{
@@ -379,6 +409,20 @@ func TestSixMarketTypesPublishListResolveAndDownload(t *testing.T) {
 			t.Fatalf("download %s status = %d location=%q body=%s", fixture.path, rec.Code, rec.Header().Get("Location"), rec.Body.String())
 		}
 	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/website-apps/docs/resolve", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy website-apps resolve status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var legacyResolved ResolveResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &legacyResolved); err != nil {
+		t.Fatalf("decode legacy resolve: %v", err)
+	}
+	if legacyResolved.Item.Type != string(TypeWebsiteApp) || legacyResolved.Item.ID != "docs" {
+		t.Fatalf("unexpected legacy resolve: %+v", legacyResolved)
+	}
 }
 
 func TestExternalWebsiteAndCLIJsonPublish(t *testing.T) {
@@ -396,7 +440,7 @@ func TestExternalWebsiteAndCLIJsonPublish(t *testing.T) {
 		Detect: &MarketDetectSpec{Commands: []string{"rg"}, VersionCommand: "rg --version"},
 	}, http.StatusOK)
 
-	publishJSON(t, handler, "/api/v1/admin/website-apps/publish", PublishRequest{
+	publishJSON(t, handler, "/api/v1/admin/webapps/publish", PublishRequest{
 		ID:          "external-docs",
 		Name:        "External Docs",
 		Version:     "1.0.0",
@@ -441,11 +485,17 @@ func TestValidatorsRejectInvalidProtocolsAndArtifacts(t *testing.T) {
 		},
 	}, http.StatusBadRequest)
 
-	publishJSON(t, handler, "/api/v1/admin/website-apps/publish", PublishRequest{
+	publishJSON(t, handler, "/api/v1/admin/webapps/publish", PublishRequest{
 		ID:          "bad-external",
 		Version:     "1.0.0",
 		WebsiteKind: WebsiteKindExternal,
 	}, http.StatusBadRequest)
+
+	publishMultipartAt(t, handler, "/api/v1/admin/agents/publish", PublishRequest{
+		ID:          "bad-agent",
+		Version:     "1.0.0",
+		ArchiveType: "agent",
+	}, tarGz(t, map[string]string{"agent/readme.md": "missing manifest"}), http.StatusBadRequest)
 
 	publishMultipartAt(t, handler, "/api/v1/admin/plugins/publish", PublishRequest{
 		ID:          "expected-plugin",
@@ -459,12 +509,34 @@ func TestValidatorsRejectInvalidProtocolsAndArtifacts(t *testing.T) {
 		ArchiveType: "pet",
 	}, tarGz(t, map[string]string{"pet/pet.json": `{"id":"bad-pet","version":"1.0.0"}`}), http.StatusBadRequest)
 
-	publishMultipartAt(t, handler, "/api/v1/admin/website-apps/publish", PublishRequest{
+	publishMultipartAt(t, handler, "/api/v1/admin/webapps/publish", PublishRequest{
 		ID:          "bad-local",
 		Version:     "1.0.0",
 		WebsiteKind: WebsiteKindLocalApp,
 		ArchiveType: "website-app",
 	}, tarGz(t, map[string]string{"app/index.html": "<h1>Missing manifest</h1>"}), http.StatusBadRequest)
+}
+
+func TestNormalizeItemTypeAliases(t *testing.T) {
+	cases := map[string]ItemType{
+		"agent":        TypeAgent,
+		"agents":       TypeAgent,
+		"智能体":          TypeAgent,
+		"webapp":       TypeWebsiteApp,
+		"webapps":      TypeWebsiteApp,
+		"website-app":  TypeWebsiteApp,
+		"website-apps": TypeWebsiteApp,
+		"网站应用":         TypeWebsiteApp,
+	}
+	for input, want := range cases {
+		got, err := normalizeItemType(input)
+		if err != nil {
+			t.Fatalf("normalizeItemType(%q) error = %v", input, err)
+		}
+		if got != want {
+			t.Fatalf("normalizeItemType(%q) = %q, want %q", input, got, want)
+		}
+	}
 }
 
 func publishMultipart(t *testing.T, handler http.Handler, metadata PublishRequest, archive []byte) {

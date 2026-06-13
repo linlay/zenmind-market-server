@@ -1,6 +1,8 @@
 # ZenMind Market Server
 
-Official-curated marketplace API for ZenMind skills, plugins, and sandbox environment templates.
+Official-curated marketplace API for ZenMind skills, plugins, agents, sandbox images, pets, CLI tools, and website WebApps.
+
+Canonical market types are `skill`, `plugin`, `agent`, `sandbox-image`, `pet`, `cli-tool`, and `website-app`. Website applications are exposed through the primary `/api/v1/webapps` route, while the legacy `/api/v1/website-apps` route remains available for compatibility.
 
 ## Development
 

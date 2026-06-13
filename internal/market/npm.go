@@ -12,6 +12,8 @@ func npmPackageName(itemType ItemType, id string) string {
 		return "@zenmind-skill/" + id
 	case TypePlugin:
 		return "@zenmind-plugin/" + id
+	case TypeAgent:
+		return "@zenmind-agent/" + id
 	case TypeSandboxImage:
 		return "@zenmind-sandbox/" + id
 	case TypePet:
@@ -37,6 +39,8 @@ func parseNpmPackageName(name string) (ItemType, string, error) {
 		return TypeSkill, id, nil
 	case "@zenmind-plugin":
 		return TypePlugin, id, nil
+	case "@zenmind-agent":
+		return TypeAgent, id, nil
 	case "@zenmind-sandbox":
 		return TypeSandboxImage, id, nil
 	case "@zenmind-pet":

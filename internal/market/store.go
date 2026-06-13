@@ -504,13 +504,15 @@ func normalizeItemType(value string) (ItemType, error) {
 		return TypeSkill, nil
 	case "plugin", "plugins":
 		return TypePlugin, nil
+	case "agent", "agents", "智能体":
+		return TypeAgent, nil
 	case "sandbox-image", "sandbox-images":
 		return TypeSandboxImage, nil
 	case "pet", "pets":
 		return TypePet, nil
 	case "cli-tool", "cli-tools":
 		return TypeCLITool, nil
-	case "website-app", "website-apps":
+	case "website-app", "website-apps", "website", "websites", "webapp", "webapps", "网站应用":
 		return TypeWebsiteApp, nil
 	default:
 		return "", fmt.Errorf("unsupported item type %q", value)

@@ -17,6 +17,7 @@ type ItemType string
 const (
 	TypeSkill        ItemType = "skill"
 	TypePlugin       ItemType = "plugin"
+	TypeAgent        ItemType = "agent"
 	TypeSandboxImage ItemType = "sandbox-image"
 	TypePet          ItemType = "pet"
 	TypeCLITool      ItemType = "cli-tool"
