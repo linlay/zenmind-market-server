@@ -476,7 +476,7 @@ func marketInfos() []MarketInfo {
 		TypePlugin:       {"tar.gz", "zip"},
 		TypeAgent:        {"agent", "tar.gz", "zip"},
 		TypeSandboxImage: {"sandbox-template", "container-image", "tar.gz", "zip"},
-		TypePet:          {"pet", "zip"},
+		TypePet:          {"zip"},
 		TypeCLITool:      {"tar.gz", "zip"},
 		TypeWebsiteApp:   {"website-app", "zip", "tar.gz"},
 	}

@@ -2,6 +2,7 @@ package market
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -71,6 +72,15 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	}
 	if len(markets.Markets) != 7 {
 		t.Fatalf("market count = %d, want 7: %+v", len(markets.Markets), markets.Markets)
+	}
+	var petMarket *MarketInfo
+	for index := range markets.Markets {
+		if markets.Markets[index].Type == string(TypePet) {
+			petMarket = &markets.Markets[index]
+		}
+	}
+	if petMarket == nil || len(petMarket.ArchiveTypes) != 1 || petMarket.ArchiveTypes[0] != "zip" {
+		t.Fatalf("pet archive types = %+v, want [zip]", petMarket)
 	}
 
 	rec = httptest.NewRecorder()
@@ -291,9 +301,9 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 				Name:        "Spark",
 				Version:     "1.0.0",
 				Description: "Animated pet",
-				ArchiveType: "pet",
+				ArchiveType: "zip",
 			},
-			archive: tarGz(t, map[string]string{"spark/pet.json": `{"id":"spark","version":"1.0.0"}`, "spark/pet-idle.png": "png"}),
+			archive: zipArchive(t, map[string]string{"spark/pet.json": `{"id":"spark","version":"1.0.0"}`, "spark/pet-idle.png": "png"}),
 		},
 		{
 			path:     "cli-tools",
@@ -401,6 +411,9 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 		if resolved.Item.Type != string(fixture.itemType) || resolved.Item.ID != fixture.id || resolved.Asset == nil || resolved.Asset.SHA256 == "" {
 			t.Fatalf("unexpected resolve for %s: %+v", fixture.path, resolved)
 		}
+		if fixture.itemType == TypePet && (resolved.Asset.ArchiveType != "zip" || !strings.HasSuffix(resolved.Asset.URL, ".zip")) {
+			t.Fatalf("pet resolve asset = %+v, want zip URL", resolved.Asset)
+		}
 
 		rec = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodGet, "/api/v1/"+fixture.path+"/"+fixture.id+"/download", nil)
@@ -506,8 +519,8 @@ func TestValidatorsRejectInvalidProtocolsAndArtifacts(t *testing.T) {
 	publishMultipartAt(t, handler, "/api/v1/admin/pets/publish", PublishRequest{
 		ID:          "bad-pet",
 		Version:     "1.0.0",
-		ArchiveType: "pet",
-	}, tarGz(t, map[string]string{"pet/pet.json": `{"id":"bad-pet","version":"1.0.0"}`}), http.StatusBadRequest)
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"pet/pet.json": `{"id":"bad-pet","version":"1.0.0"}`}), http.StatusBadRequest)
 
 	publishMultipartAt(t, handler, "/api/v1/admin/webapps/publish", PublishRequest{
 		ID:          "bad-local",
@@ -581,6 +594,25 @@ func publishJSON(t *testing.T, handler http.Handler, path string, metadata Publi
 	if rec.Code != wantStatus {
 		t.Fatalf("publish JSON %s status = %d, want %d body=%s", path, rec.Code, wantStatus, rec.Body.String())
 	}
+}
+
+func zipArchive(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("zip create: %v", err)
+		}
+		if _, err := io.Copy(w, bytes.NewReader([]byte(content))); err != nil {
+			t.Fatalf("zip copy: %v", err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+	return buf.Bytes()
 }
 
 func tarGz(t *testing.T, files map[string]string) []byte {

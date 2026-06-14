@@ -20,6 +20,23 @@ Default paths:
 
 Admin APIs accept either `Authorization: Bearer $MARKET_ADMIN_TOKEN` or trusted official proxy headers with `X-ZenMind-Market-Proxy-Token: $MARKET_PROXY_TOKEN`.
 
+## Storage and deployment
+
+The server is the source of truth for market data. The website should read `/api/v1/catalog`; uploaded artifacts should never be baked into the frontend image or copied into the nginx static directory.
+
+In container deployments, keep SQLite and artifacts in the same persistent backend volume:
+
+```yaml
+environment:
+  MARKET_DB_PATH: /data/market.db
+  MARKET_ARTIFACT_ROOT: /data/artifacts
+  MARKET_PUBLIC_BASE_URL: https://market.example.com
+volumes:
+  - /srv/zenmind-market/data:/data
+```
+
+Published artifact files are stored under `/data/artifacts/{type}/{id}/{version}/...`, while SQLite stores metadata, checksums, and generated artifact URLs. Configure `MARKET_PUBLIC_BASE_URL` to the final public market domain before publishing, because artifact URLs are written into SQLite when an artifact is uploaded.
+
 ## Environment
 
 The server loads `.env` from the current working directory before building its runtime config. Existing shell variables win over values in `.env`.

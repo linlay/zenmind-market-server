@@ -619,7 +619,7 @@ func normalizeArchiveType(value string, itemType ItemType, sandboxKind, websiteK
 		return "agent"
 	}
 	if itemType == TypePet {
-		return "pet"
+		return "zip"
 	}
 	if itemType == TypeWebsiteApp {
 		if websiteKind == WebsiteKindExternal {
