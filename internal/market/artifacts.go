@@ -77,9 +77,61 @@ func validatePublishRequest(req *PublishRequest) error {
 	if err := normalizeDependencies(req.Type, req.Dependencies); err != nil {
 		return err
 	}
+	if err := normalizePublishPlatform(req); err != nil {
+		return err
+	}
 	if err := validatePublishProtocol(req); err != nil {
 		return err
 	}
+	return nil
+}
+
+func normalizePublishPlatform(req *PublishRequest) error {
+	spec := req.Platform
+	if spec == nil {
+		spec = &MarketPlatformSpec{
+			Key:               req.PlatformKey,
+			Description:       req.Description,
+			Readme:            req.Readme,
+			MinDesktopVersion: req.MinDesktopVersion,
+			Metadata:          req.Metadata,
+			Dependencies:      req.Dependencies,
+			Install:           req.Install,
+			Uninstall:         req.Uninstall,
+			Detect:            req.Detect,
+		}
+	} else {
+		if strings.TrimSpace(spec.Key) == "" {
+			spec.Key = spec.Platform
+		}
+		if strings.TrimSpace(spec.Key) == "" {
+			spec.Key = req.PlatformKey
+		}
+	}
+	spec.Key = sanitizePlatform(spec.Key)
+	if spec.Key == "" {
+		spec.Key = "universal"
+	}
+	spec.Platform = sanitizePlatform(spec.Platform)
+	if spec.Platform == "" {
+		spec.Platform = spec.Key
+	}
+	spec.OS = sanitizePlatform(spec.OS)
+	spec.Arch = sanitizePlatform(spec.Arch)
+	spec.Description = strings.TrimSpace(spec.Description)
+	spec.Readme = strings.TrimSpace(spec.Readme)
+	spec.MinDesktopVersion = strings.TrimSpace(spec.MinDesktopVersion)
+	if spec.Metadata == nil {
+		spec.Metadata = map[string]string{}
+	}
+	if spec.Dependencies == nil {
+		spec.Dependencies = []MarketDependency{}
+	}
+	if err := normalizeDependencies(req.Type, spec.Dependencies); err != nil {
+		return err
+	}
+	req.PlatformKey = spec.Key
+	req.Platform = spec
 	return nil
 }
 
@@ -471,20 +523,32 @@ var allowedDependencyKinds = map[ItemType][]string{
 }
 
 func validatePublishProtocol(req *PublishRequest) error {
-	if req.Type != TypeCLITool && (scriptSpecHasContent(req.Install) || scriptSpecHasContent(req.Uninstall)) {
-		return fmt.Errorf("%s does not allow market-level install or uninstall scripts", req.Type)
+	if err := validateProtocolForType(req.Type, "market-level", req.Install, req.Uninstall, req.Detect); err != nil {
+		return err
 	}
-	if req.Type == TypeCLITool {
-		if err := validateScriptSpec("install", req.Install); err != nil {
+	if req.Platform != nil {
+		if err := validateProtocolForType(req.Type, "platform-level", req.Platform.Install, req.Platform.Uninstall, req.Platform.Detect); err != nil {
 			return err
 		}
-		if err := validateScriptSpec("uninstall", req.Uninstall); err != nil {
+	}
+	return nil
+}
+
+func validateProtocolForType(itemType ItemType, label string, install, uninstall *MarketScriptSpec, detect *MarketDetectSpec) error {
+	if itemType != TypeCLITool && (scriptSpecHasContent(install) || scriptSpecHasContent(uninstall)) {
+		return fmt.Errorf("%s does not allow %s install or uninstall scripts", itemType, label)
+	}
+	if itemType == TypeCLITool {
+		if err := validateScriptSpec(label+".install", install); err != nil {
+			return err
+		}
+		if err := validateScriptSpec(label+".uninstall", uninstall); err != nil {
 			return err
 		}
 		return nil
 	}
-	if req.Detect != nil && (len(req.Detect.Commands) > 0 || strings.TrimSpace(req.Detect.VersionCommand) != "") {
-		return fmt.Errorf("%s does not support market-level detect commands", req.Type)
+	if detect != nil && (len(detect.Commands) > 0 || strings.TrimSpace(detect.VersionCommand) != "") {
+		return fmt.Errorf("%s does not support %s detect commands", itemType, label)
 	}
 	return nil
 }

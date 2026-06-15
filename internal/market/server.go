@@ -62,6 +62,12 @@ func (a *App) Routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}/download", func(w http.ResponseWriter, r *http.Request) {
 			a.handleMarketDownload(w, r, route.Type)
 		})
+		mux.HandleFunc("POST /api/v1/"+route.Path+"/{id}/favorite", func(w http.ResponseWriter, r *http.Request) {
+			a.handleMarketFavorite(w, r, route.Type, true)
+		})
+		mux.HandleFunc("DELETE /api/v1/"+route.Path+"/{id}/favorite", func(w http.ResponseWriter, r *http.Request) {
+			a.handleMarketFavorite(w, r, route.Type, false)
+		})
 		mux.HandleFunc("POST /api/v1/admin/"+route.Path+"/publish", a.requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 			a.handleTypedPublish(w, r, route.Type)
 		}))
@@ -91,7 +97,7 @@ func (a *App) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		}
 		itemType = normalized
 	}
-	items, err := a.store.ListPublic(r.Context(), itemType)
+	items, err := a.store.ListPublic(r.Context(), itemType, a.viewerUserID(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
@@ -102,7 +108,7 @@ func (a *App) handleCatalog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
-	items, err := a.store.ListPublic(r.Context(), "")
+	items, err := a.store.ListPublic(r.Context(), "", a.viewerUserID(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
@@ -118,17 +124,23 @@ func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
 			Description:       public.Description,
 			Readme:            public.Readme,
 			Tags:              public.Tags,
+			Author:            public.Author,
 			MinDesktopVersion: public.MinDesktopVersion,
 			SandboxKind:       public.SandboxKind,
 			WebsiteKind:       public.WebsiteKind,
 			Assets:            public.Assets,
+			Platforms:         public.Platforms,
 			Dependencies:      public.Dependencies,
 			Metadata:          public.Metadata,
 			Install:           public.Install,
 			Uninstall:         public.Uninstall,
 			Detect:            public.Detect,
+			CreatedAt:         public.CreatedAt,
 			PublishedAt:       public.PublishedAt,
 			UpdatedAt:         public.UpdatedAt,
+			DownloadCount:     public.DownloadCount,
+			FavoriteCount:     public.FavoriteCount,
+			Favorited:         public.Favorited,
 		})
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -140,7 +152,7 @@ func (a *App) handleItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
 		return
 	}
-	item, err := a.store.GetPublic(r.Context(), itemType, sanitizeSlug(r.PathValue("id")))
+	item, err := a.store.GetPublic(r.Context(), itemType, sanitizeSlug(r.PathValue("id")), a.viewerUserID(r))
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "not_found", "market item not found")
 		return
@@ -158,7 +170,7 @@ func (a *App) handleMarketList(w http.ResponseWriter, r *http.Request, itemType 
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	items, err := a.store.ListPublic(r.Context(), itemType)
+	items, err := a.store.ListPublic(r.Context(), itemType, a.viewerUserID(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
@@ -177,7 +189,7 @@ func (a *App) handleMarketList(w http.ResponseWriter, r *http.Request, itemType 
 }
 
 func (a *App) handleMarketItem(w http.ResponseWriter, r *http.Request, itemType ItemType) {
-	item, err := a.store.GetPublic(r.Context(), itemType, sanitizeSlug(r.PathValue("id")))
+	item, err := a.store.GetPublic(r.Context(), itemType, sanitizeSlug(r.PathValue("id")), a.viewerUserID(r))
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "not_found", "market item not found")
 		return
@@ -191,7 +203,7 @@ func (a *App) handleMarketItem(w http.ResponseWriter, r *http.Request, itemType 
 
 func (a *App) handleMarketVersions(w http.ResponseWriter, r *http.Request, itemType ItemType) {
 	id := sanitizeSlug(r.PathValue("id"))
-	item, err := a.store.GetPublic(r.Context(), itemType, id)
+	item, err := a.store.GetPublic(r.Context(), itemType, id, a.viewerUserID(r))
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "not_found", "market item not found")
 		return
@@ -210,7 +222,7 @@ func (a *App) handleMarketVersions(w http.ResponseWriter, r *http.Request, itemT
 
 func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemType ItemType) {
 	id := sanitizeSlug(r.PathValue("id"))
-	item, err := a.store.GetPublic(r.Context(), itemType, id)
+	item, err := a.store.GetPublic(r.Context(), itemType, id, a.viewerUserID(r))
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "not_found", "market item not found")
 		return
@@ -224,9 +236,19 @@ func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemTy
 		version = item.LatestVersion
 	}
 	platform := strings.TrimSpace(r.URL.Query().Get("platform"))
+	platformSpec, platformErr := a.store.GetPlatform(r.Context(), itemType, id, version, platform)
+	if platformErr != nil && !errors.Is(platformErr, sql.ErrNoRows) {
+		writeError(w, http.StatusInternalServerError, "store_error", platformErr.Error())
+		return
+	}
 	artifact, err := a.store.GetArtifact(r.Context(), itemType, id, version, platform)
 	if errors.Is(err, sql.ErrNoRows) {
-		writeJSON(w, http.StatusOK, ResolveResponse{SchemaVersion: 1, Item: publicItem(item), Version: version, Platform: platform})
+		response := ResolveResponse{SchemaVersion: 1, Item: publicItem(item), Version: version, Platform: platform}
+		if platformErr == nil {
+			response.Platform = platformSpec.Platform
+			response.PlatformSpec = &platformSpec
+		}
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	if err != nil {
@@ -242,11 +264,48 @@ func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemTy
 		Platform:    artifact.PlatformKey,
 		Role:        artifact.AssetRole,
 	}
-	writeJSON(w, http.StatusOK, ResolveResponse{SchemaVersion: 1, Item: publicItem(item), Version: artifact.Version, Platform: artifact.PlatformKey, Asset: &asset})
+	response := ResolveResponse{SchemaVersion: 1, Item: publicItem(item), Version: artifact.Version, Platform: artifact.PlatformKey, Asset: &asset}
+	if platformErr == nil {
+		response.PlatformSpec = &platformSpec
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (a *App) handleMarketDownload(w http.ResponseWriter, r *http.Request, itemType ItemType) {
 	a.downloadArtifact(w, r, itemType, sanitizeSlug(r.PathValue("id")), r.URL.Query().Get("version"), r.URL.Query().Get("platform"))
+}
+
+func (a *App) handleMarketFavorite(w http.ResponseWriter, r *http.Request, itemType ItemType, favorite bool) {
+	id := sanitizeSlug(r.PathValue("id"))
+	userID := a.viewerUserID(r)
+	if userID == "" {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "trusted proxy user required")
+		return
+	}
+	var err error
+	if favorite {
+		err = a.store.FavoriteItem(r.Context(), itemType, id, userID)
+	} else {
+		err = a.store.UnfavoriteItem(r.Context(), itemType, id, userID)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	item, err := a.store.GetPublic(r.Context(), itemType, id, userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, publicItem(item))
 }
 
 func (a *App) handlePublish(w http.ResponseWriter, r *http.Request) {
@@ -351,7 +410,7 @@ func (a *App) handleNPM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 		return
 	}
-	item, err := a.store.GetPublic(r.Context(), itemType, id)
+	item, err := a.store.GetPublic(r.Context(), itemType, id, "")
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "not_found", "package not found")
 		return
@@ -413,6 +472,13 @@ func (a *App) authorizedAdmin(r *http.Request) bool {
 	}
 	role := strings.ToLower(strings.TrimSpace(r.Header.Get("X-ZenMind-User-Role")))
 	return role == "admin"
+}
+
+func (a *App) viewerUserID(r *http.Request) string {
+	if a.cfg.ProxyToken == "" || r.Header.Get("X-ZenMind-Market-Proxy-Token") != a.cfg.ProxyToken {
+		return ""
+	}
+	return strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
 }
 
 func intQuery(r *http.Request, key string, fallback int) int {

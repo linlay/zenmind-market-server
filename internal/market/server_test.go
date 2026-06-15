@@ -134,6 +134,10 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	if len(catalog.Items[0].Dependencies) != 1 || catalog.Items[0].Metadata["author"] != "zenmind" {
 		t.Fatalf("desktop catalog missing protocol fields: %+v", catalog.Items[0])
 	}
+	universalPlatform, ok := catalog.Items[0].Platforms["universal"]
+	if !ok || universalPlatform.Platform != "universal" || len(universalPlatform.Dependencies) != 1 || universalPlatform.Metadata["author"] != "zenmind" {
+		t.Fatalf("desktop catalog missing universal platform: %+v", catalog.Items[0].Platforms)
+	}
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/demo/versions", nil)
@@ -169,6 +173,200 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	if rec.Code != http.StatusFound || rec.Header().Get("Location") == "" {
 		t.Fatalf("download status = %d location=%q body=%s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
 	}
+}
+
+func TestPublicItemStatsAndDownloadCount(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	for _, version := range []string{"1.0.0", "2.0.0"} {
+		publishMultipart(t, handler, PublishRequest{
+			Type:        TypeSkill,
+			ID:          "stats",
+			Name:        "Stats Skill",
+			Version:     version,
+			Description: "Tracks stats",
+			ArchiveType: "zip",
+			Metadata:    map[string]string{"author": "ZenMind Labs"},
+		}, zipArchive(t, map[string]string{"stats/SKILL.md": "# Stats " + version + "\n"}))
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/catalog?type=skill", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var catalog CatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &catalog); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	if len(catalog.Items) != 1 {
+		t.Fatalf("catalog item count = %d, want 1: %+v", len(catalog.Items), catalog.Items)
+	}
+	item := catalog.Items[0]
+	if item.Author != "ZenMind Labs" || item.CreatedAt.IsZero() || !item.CreatedAt.Equal(item.PublishedAt) {
+		t.Fatalf("unexpected author/created fields: %+v", item)
+	}
+	if item.DownloadCount != 0 || item.FavoriteCount != 0 || item.Favorited {
+		t.Fatalf("unexpected initial stats: %+v", item)
+	}
+
+	for _, version := range []string{"1.0.0", "2.0.0"} {
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/stats/download?version="+version, nil)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound || rec.Header().Get("Location") == "" {
+			t.Fatalf("download %s status = %d location=%q body=%s", version, rec.Code, rec.Header().Get("Location"), rec.Body.String())
+		}
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/items/skill/stats", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var detail PublicItem
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if detail.DownloadCount != 2 {
+		t.Fatalf("detail downloadCount = %d, want 2: %+v", detail.DownloadCount, detail)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/stats/resolve", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resolved ResolveResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resolved); err != nil {
+		t.Fatalf("decode resolve: %v", err)
+	}
+	if resolved.Item.DownloadCount != 2 || resolved.Item.Author != "ZenMind Labs" || resolved.Item.CreatedAt.IsZero() {
+		t.Fatalf("resolve item missing public stats: %+v", resolved.Item)
+	}
+}
+
+func TestFavoriteItemsUseTrustedProxyUser(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type:        TypeSkill,
+		ID:          "favorite-demo",
+		Name:        "Favorite Demo",
+		Version:     "1.0.0",
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"favorite-demo/SKILL.md": "# Favorite\n"}))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/favorite-demo/favorite", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("favorite without proxy status = %d, want 401 body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/skills/favorite-demo/favorite", nil)
+	req.Header.Set("X-ZenMind-Market-Proxy-Token", "proxy-secret")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("favorite without user status = %d, want 401 body=%s", rec.Code, rec.Body.String())
+	}
+
+	aliceFavorite := favoriteRequest(t, handler, http.MethodPost, "/api/v1/skills/favorite-demo/favorite", "alice", http.StatusOK)
+	if aliceFavorite.FavoriteCount != 1 || !aliceFavorite.Favorited {
+		t.Fatalf("alice favorite response = %+v, want count 1 and favorited", aliceFavorite)
+	}
+	aliceFavorite = favoriteRequest(t, handler, http.MethodPost, "/api/v1/skills/favorite-demo/favorite", "alice", http.StatusOK)
+	if aliceFavorite.FavoriteCount != 1 || !aliceFavorite.Favorited {
+		t.Fatalf("repeat alice favorite response = %+v, want idempotent count 1", aliceFavorite)
+	}
+	bobFavorite := favoriteRequest(t, handler, http.MethodPost, "/api/v1/skills/favorite-demo/favorite", "bob", http.StatusOK)
+	if bobFavorite.FavoriteCount != 2 || !bobFavorite.Favorited {
+		t.Fatalf("bob favorite response = %+v, want count 2 and favorited", bobFavorite)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/items/skill/favorite-demo", nil)
+	setProxyUser(req, "alice")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alice detail status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var detail PublicItem
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if detail.FavoriteCount != 2 || !detail.Favorited {
+		t.Fatalf("alice detail favorite state = %+v", detail)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/catalog?type=skill", nil)
+	setProxyUser(req, "alice")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alice catalog status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var catalog CatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &catalog); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	if len(catalog.Items) != 1 || catalog.Items[0].FavoriteCount != 2 || !catalog.Items[0].Favorited {
+		t.Fatalf("alice catalog favorite state = %+v", catalog.Items)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/favorite-demo/versions", nil)
+	setProxyUser(req, "alice")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("versions status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var versions VersionsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &versions); err != nil {
+		t.Fatalf("decode versions: %v", err)
+	}
+	if versions.Item.FavoriteCount != 2 || !versions.Item.Favorited {
+		t.Fatalf("versions item favorite state = %+v", versions.Item)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/items/skill/favorite-demo", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("anonymous detail status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode anonymous detail: %v", err)
+	}
+	if detail.FavoriteCount != 2 || detail.Favorited {
+		t.Fatalf("anonymous detail favorite state = %+v", detail)
+	}
+
+	aliceFavorite = favoriteRequest(t, handler, http.MethodDelete, "/api/v1/skills/favorite-demo/favorite", "alice", http.StatusOK)
+	if aliceFavorite.FavoriteCount != 1 || aliceFavorite.Favorited {
+		t.Fatalf("alice unfavorite response = %+v, want count 1 and not favorited", aliceFavorite)
+	}
+	aliceFavorite = favoriteRequest(t, handler, http.MethodDelete, "/api/v1/skills/favorite-demo/favorite", "alice", http.StatusOK)
+	if aliceFavorite.FavoriteCount != 1 || aliceFavorite.Favorited {
+		t.Fatalf("repeat alice unfavorite response = %+v, want idempotent count 1", aliceFavorite)
+	}
+
+	_ = favoriteRequest(t, handler, http.MethodPost, "/api/v1/skills/missing/favorite", "alice", http.StatusNotFound)
+	_ = favoriteRequest(t, handler, http.MethodDelete, "/api/v1/skills/missing/favorite", "alice", http.StatusNotFound)
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"favorite-demo"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unpublish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	_ = favoriteRequest(t, handler, http.MethodPost, "/api/v1/skills/favorite-demo/favorite", "alice", http.StatusNotFound)
 }
 
 func TestCatalogHandlesConcurrentRequests(t *testing.T) {
@@ -611,6 +809,152 @@ func TestExternalWebsiteAndCLIJsonPublish(t *testing.T) {
 	}
 }
 
+func TestVersionPlatformsCarryPlatformSpecificProtocol(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	publishMultipartAt(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
+		ID:          "zmctl",
+		Name:        "ZenMind CLI",
+		Version:     "1.0.0",
+		Description: "Global CLI description",
+		ArchiveType: "zip",
+		Platform: &MarketPlatformSpec{
+			Key:               "darwin-arm64",
+			OS:                "darwin",
+			Arch:              "arm64",
+			Description:       "macOS Apple Silicon build",
+			MinDesktopVersion: "1.2.0",
+			Metadata:          map[string]string{"packageManager": "homebrew"},
+			Dependencies: []MarketDependency{{
+				Kind:     DependencySystemRuntime,
+				Phase:    DependencyPhaseInstall,
+				Required: true,
+				Runtime:  "homebrew",
+			}},
+			Install: &MarketScriptSpec{Command: "brew install zmctl"},
+			Detect:  &MarketDetectSpec{Commands: []string{"zmctl"}, VersionCommand: "zmctl --version"},
+		},
+	}, zipArchive(t, map[string]string{"bin/zmctl": "#!/bin/sh\n"}), http.StatusOK)
+
+	publishMultipartAt(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
+		ID:          "zmctl",
+		Name:        "ZenMind CLI",
+		Version:     "1.0.0",
+		Description: "Global CLI description",
+		ArchiveType: "zip",
+		Platform: &MarketPlatformSpec{
+			Key:               "linux-amd64",
+			OS:                "linux",
+			Arch:              "amd64",
+			Description:       "Linux x64 build",
+			MinDesktopVersion: "1.1.0",
+			Metadata:          map[string]string{"packageManager": "apt"},
+			Dependencies: []MarketDependency{{
+				Kind:     DependencySystemCommand,
+				Phase:    DependencyPhaseInstall,
+				Required: true,
+				Command:  "apt-get",
+			}},
+			Install: &MarketScriptSpec{Command: "sudo apt-get install zmctl"},
+			Detect:  &MarketDetectSpec{Commands: []string{"zmctl"}, VersionCommand: "zmctl --version"},
+		},
+	}, zipArchive(t, map[string]string{"bin/zmctl": "#!/bin/sh\n"}), http.StatusOK)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/catalog?type=cli-tool", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var catalog CatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &catalog); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	if len(catalog.Items) != 1 {
+		t.Fatalf("catalog item count = %d, want 1: %+v", len(catalog.Items), catalog.Items)
+	}
+	darwin := catalog.Items[0].Platforms["darwin-arm64"]
+	linux := catalog.Items[0].Platforms["linux-amd64"]
+	if darwin.Install == nil || darwin.Install.Command != "brew install zmctl" || darwin.Metadata["packageManager"] != "homebrew" || darwin.MinDesktopVersion != "1.2.0" {
+		t.Fatalf("darwin platform did not round-trip: %+v", darwin)
+	}
+	if linux.Install == nil || linux.Install.Command != "sudo apt-get install zmctl" || linux.Metadata["packageManager"] != "apt" || linux.MinDesktopVersion != "1.1.0" {
+		t.Fatalf("linux platform did not round-trip: %+v", linux)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/cli-tools/zmctl/resolve?platform=darwin-arm64", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resolved ResolveResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resolved); err != nil {
+		t.Fatalf("decode resolve: %v", err)
+	}
+	if resolved.Asset == nil || resolved.Asset.Platform != "darwin-arm64" || resolved.PlatformSpec == nil || resolved.PlatformSpec.Install == nil || resolved.PlatformSpec.Install.Command != "brew install zmctl" {
+		t.Fatalf("unexpected darwin resolve: %+v", resolved)
+	}
+}
+
+func TestResolvePlatformSpecFallsBackWithoutArtifact(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	publishJSON(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
+		ID:      "json-cli",
+		Name:    "JSON CLI",
+		Version: "1.0.0",
+		Platform: &MarketPlatformSpec{
+			Key:     "universal",
+			Install: &MarketScriptSpec{Command: "install universal"},
+		},
+	}, http.StatusOK)
+	publishJSON(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
+		ID:      "json-cli",
+		Name:    "JSON CLI",
+		Version: "1.0.0",
+		Platform: &MarketPlatformSpec{
+			Key:     "linux",
+			Install: &MarketScriptSpec{Command: "install linux"},
+		},
+	}, http.StatusOK)
+	publishJSON(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
+		ID:      "json-cli",
+		Name:    "JSON CLI",
+		Version: "1.0.0",
+		Platform: &MarketPlatformSpec{
+			Key:               "linux-amd64",
+			OS:                "linux",
+			Arch:              "amd64",
+			MinDesktopVersion: "1.3.0",
+			Install:           &MarketScriptSpec{Command: "install linux amd64"},
+			Detect:            &MarketDetectSpec{Commands: []string{"json-cli"}, VersionCommand: "json-cli --version"},
+		},
+	}, http.StatusOK)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/cli-tools/json-cli/resolve?platform=linux-amd64-apt", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resolved ResolveResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resolved); err != nil {
+		t.Fatalf("decode resolve: %v", err)
+	}
+	if resolved.Asset != nil {
+		t.Fatalf("json-only resolve returned asset: %+v", resolved.Asset)
+	}
+	if resolved.Platform != "linux-amd64" || resolved.PlatformSpec == nil || resolved.PlatformSpec.Install == nil || resolved.PlatformSpec.Install.Command != "install linux amd64" {
+		t.Fatalf("unexpected linux-amd64 fallback resolve: %+v", resolved)
+	}
+	if resolved.PlatformSpec.MinDesktopVersion != "1.3.0" || resolved.PlatformSpec.Detect == nil || resolved.PlatformSpec.Detect.VersionCommand != "json-cli --version" {
+		t.Fatalf("platform spec missing detail: %+v", resolved.PlatformSpec)
+	}
+}
+
 func TestPluginValidatorAcceptsPluginAPIVersionManifest(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
@@ -819,6 +1163,30 @@ func TestNormalizeItemTypeAliases(t *testing.T) {
 			t.Fatalf("normalizeItemType(%q) = %q, want %q", input, got, want)
 		}
 	}
+}
+
+func favoriteRequest(t *testing.T, handler http.Handler, method, path, userID string, wantStatus int) PublicItem {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	setProxyUser(req, userID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != wantStatus {
+		t.Fatalf("%s %s status = %d, want %d body=%s", method, path, rec.Code, wantStatus, rec.Body.String())
+	}
+	if rec.Code != http.StatusOK {
+		return PublicItem{}
+	}
+	var item PublicItem
+	if err := json.Unmarshal(rec.Body.Bytes(), &item); err != nil {
+		t.Fatalf("decode favorite response: %v", err)
+	}
+	return item
+}
+
+func setProxyUser(req *http.Request, userID string) {
+	req.Header.Set("X-ZenMind-Market-Proxy-Token", "proxy-secret")
+	req.Header.Set("X-ZenMind-User-ID", userID)
 }
 
 func publishMultipart(t *testing.T, handler http.Handler, metadata PublishRequest, archive []byte) {
