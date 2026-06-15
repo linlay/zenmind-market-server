@@ -38,7 +38,7 @@ func newTestApp(t *testing.T) *App {
 func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
-	archive := tarGz(t, map[string]string{
+	archive := zipArchive(t, map[string]string{
 		"demo/SKILL.md": "# Demo\n",
 	})
 	publishMultipart(t, handler, PublishRequest{
@@ -47,8 +47,9 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 		Name:        "Demo Skill",
 		Version:     "1.0.0",
 		Description: "A demo skill",
+		Readme:      "# Demo Skill\n",
 		Tags:        []string{"demo"},
-		ArchiveType: "tar.gz",
+		ArchiveType: "zip",
 		Metadata:    map[string]string{"author": "zenmind"},
 		Dependencies: []MarketDependency{{
 			Kind:        DependencySandboxImage,
@@ -73,11 +74,22 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	if len(markets.Markets) != 7 {
 		t.Fatalf("market count = %d, want 7: %+v", len(markets.Markets), markets.Markets)
 	}
+	archiveTypesByType := map[string][]string{}
 	var petMarket *MarketInfo
 	for index := range markets.Markets {
+		archiveTypesByType[markets.Markets[index].Type] = markets.Markets[index].ArchiveTypes
 		if markets.Markets[index].Type == string(TypePet) {
 			petMarket = &markets.Markets[index]
 		}
+	}
+	if got := strings.Join(archiveTypesByType[string(TypeSkill)], ","); got != "zip" {
+		t.Fatalf("skill archive types = %q, want zip", got)
+	}
+	if got := strings.Join(archiveTypesByType[string(TypePlugin)], ","); got != "zip" {
+		t.Fatalf("plugin archive types = %q, want zip", got)
+	}
+	if got := strings.Join(archiveTypesByType[string(TypeSandboxImage)], ","); got != "zip,tar.gz" {
+		t.Fatalf("sandbox-image archive types = %q, want zip,tar.gz", got)
 	}
 	if petMarket == nil || len(petMarket.ArchiveTypes) != 1 || petMarket.ArchiveTypes[0] != "zip" {
 		t.Fatalf("pet archive types = %+v, want [zip]", petMarket)
@@ -112,6 +124,9 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	}
 	if len(catalog.Items) != 1 || catalog.Items[0].Assets["universal"].SHA256 == "" {
 		t.Fatalf("unexpected desktop catalog: %+v", catalog)
+	}
+	if catalog.Items[0].Readme == "" || catalog.Items[0].PublishedAt.IsZero() || catalog.Items[0].UpdatedAt.IsZero() {
+		t.Fatalf("desktop catalog missing detail fields: %+v", catalog.Items[0])
 	}
 	if len(catalog.Items[0].Dependencies) != 1 || catalog.Items[0].Metadata["author"] != "zenmind" {
 		t.Fatalf("desktop catalog missing protocol fields: %+v", catalog.Items[0])
@@ -156,8 +171,8 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 func TestNpmPackument(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
-	publishMultipart(t, handler, PublishRequest{Type: TypeSkill, ID: "demo", Name: "Demo", Version: "1.0.0", ArchiveType: "tar.gz"}, tarGz(t, map[string]string{"demo/SKILL.md": "# Demo\n"}))
-	publishMultipart(t, handler, PublishRequest{Type: TypeAgent, ID: "assistant", Name: "Assistant", Version: "1.0.0", ArchiveType: "agent"}, tarGz(t, map[string]string{"assistant/agent.yml": "name: Assistant\n"}))
+	publishMultipart(t, handler, PublishRequest{Type: TypeSkill, ID: "demo", Name: "Demo", Version: "1.0.0", ArchiveType: "zip"}, zipArchive(t, map[string]string{"demo/SKILL.md": "# Demo\n"}))
+	publishMultipart(t, handler, PublishRequest{Type: TypeAgent, ID: "assistant", Name: "Assistant", Version: "1.0.0", ArchiveType: "zip"}, zipArchive(t, map[string]string{"assistant/agent.yml": "name: Assistant\n"}))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/npm/@zenmind-skill/demo", nil)
@@ -193,7 +208,7 @@ func TestAdminAuthRejectsMissingToken(t *testing.T) {
 func TestSandboxTemplateValidation(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
-	archive := tarGz(t, map[string]string{
+	archive := zipArchive(t, map[string]string{
 		"python/environment.json": `{"name":"python","image_repository":"python","image_tag":"3.12"}`,
 		"python/files/Dockerfile": "FROM python:3.12\n",
 	})
@@ -203,7 +218,7 @@ func TestSandboxTemplateValidation(t *testing.T) {
 		Name:        "Python",
 		Version:     "1.0.0",
 		Description: "Python sandbox",
-		ArchiveType: "sandbox-template",
+		ArchiveType: "zip",
 	}, archive)
 
 	rec := httptest.NewRecorder()
@@ -237,9 +252,9 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 				Name:        "Shared Skill",
 				Version:     "1.0.0",
 				Description: "Skill with a shared id",
-				ArchiveType: "tar.gz",
+				ArchiveType: "zip",
 			},
-			archive: tarGz(t, map[string]string{"skill/SKILL.md": "# Shared\n"}),
+			archive: zipArchive(t, map[string]string{"skill/SKILL.md": "# Shared\n"}),
 		},
 		{
 			path:     "plugins",
@@ -250,9 +265,9 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 				Name:        "Shared Plugin",
 				Version:     "1.0.0",
 				Description: "Plugin with a shared id",
-				ArchiveType: "tar.gz",
+				ArchiveType: "zip",
 			},
-			archive: tarGz(t, map[string]string{"plugin/manifest.json": `{"kind":"plugin","id":"shared-id","version":"1.0.0","scripts":{"deploy":"./deploy.sh","start":"./start.sh","stop":"./stop.sh"}}`}),
+			archive: zipArchive(t, map[string]string{"plugin/manifest.json": `{"kind":"plugin","id":"shared-id","version":"1.0.0","scripts":{"deploy":"./deploy.sh","start":"./start.sh","stop":"./stop.sh"}}`}),
 		},
 		{
 			path:     "agents",
@@ -263,7 +278,7 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 				Name:        "Planner Agent",
 				Version:     "1.0.0",
 				Description: "Task planning agent",
-				ArchiveType: "agent",
+				ArchiveType: "zip",
 				Dependencies: []MarketDependency{{
 					Kind:      DependencyBuiltinService,
 					Phase:     DependencyPhaseRuntime,
@@ -271,7 +286,7 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 					ServiceID: "agent-platform",
 				}},
 			},
-			archive: tarGz(t, map[string]string{"planner/agent.yml": "name: Planner\n"}),
+			archive: zipArchive(t, map[string]string{"planner/agent.yml": "name: Planner\n"}),
 		},
 		{
 			path:     "sandbox-images",
@@ -282,7 +297,7 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 				Name:        "Python Sandbox",
 				Version:     "1.0.0",
 				Description: "Python environment template",
-				ArchiveType: "sandbox-template",
+				ArchiveType: "zip",
 				Dependencies: []MarketDependency{{
 					Kind:      DependencyBuiltinService,
 					Phase:     DependencyPhaseRuntime,
@@ -290,7 +305,7 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 					ServiceID: "agent-container-hub",
 				}},
 			},
-			archive: tarGz(t, map[string]string{"python/environment.json": `{"name":"python","image_repository":"python","image_tag":"3.12"}`}),
+			archive: zipArchive(t, map[string]string{"python/environment.json": `{"name":"python","image_repository":"python","image_tag":"3.12"}`}),
 		},
 		{
 			path:     "pets",
@@ -314,11 +329,11 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 				Name:        "ZenMind CLI",
 				Version:     "1.0.0",
 				Description: "CLI helper",
-				ArchiveType: "tar.gz",
+				ArchiveType: "zip",
 				Install:     &MarketScriptSpec{Command: "brew install zmctl"},
 				Detect:      &MarketDetectSpec{Commands: []string{"zmctl"}, VersionCommand: "zmctl --version"},
 			},
-			archive: tarGz(t, map[string]string{"bin/zmctl": "#!/bin/sh\n"}),
+			archive: zipArchive(t, map[string]string{"bin/zmctl": "#!/bin/sh\n"}),
 		},
 		{
 			path:     "webapps",
@@ -330,7 +345,7 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 				Version:     "1.0.0",
 				Description: "Local docs website",
 				WebsiteKind: WebsiteKindLocalApp,
-				ArchiveType: "website-app",
+				ArchiveType: "zip",
 				Dependencies: []MarketDependency{{
 					Kind:     DependencySystemRuntime,
 					Phase:    DependencyPhaseRuntime,
@@ -338,7 +353,7 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 					Runtime:  "node",
 				}},
 			},
-			archive: tarGz(t, map[string]string{"docs/website.json": `{"id":"docs","version":"1.0.0"}`, "docs/index.html": "<h1>Docs</h1>"}),
+			archive: zipArchive(t, map[string]string{"docs/website.json": `{"id":"docs","version":"1.0.0"}`, "docs/index.html": "<h1>Docs</h1>"}),
 		},
 	}
 
@@ -489,6 +504,131 @@ func TestPluginValidatorAcceptsPluginAPIVersionManifest(t *testing.T) {
 	}, zipArchive(t, map[string]string{"calendar/manifest.json": `{"pluginApiVersion":1,"id":"calendar","version":"v0.1.0"}`}), http.StatusOK)
 }
 
+func TestArchiveTypeContractRejectsNonZipInstallAssets(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	cases := []struct {
+		name    string
+		path    string
+		req     PublishRequest
+		archive []byte
+	}{
+		{
+			name: "skill tar.gz",
+			path: "/api/v1/admin/skills/publish",
+			req: PublishRequest{
+				ID:          "legacy-skill",
+				Version:     "1.0.0",
+				ArchiveType: "tar.gz",
+			},
+			archive: tarGz(t, map[string]string{"skill/SKILL.md": "# Legacy\n"}),
+		},
+		{
+			name: "plugin tar.gz",
+			path: "/api/v1/admin/plugins/publish",
+			req: PublishRequest{
+				ID:          "legacy-plugin",
+				Version:     "1.0.0",
+				ArchiveType: "tar.gz",
+			},
+			archive: tarGz(t, map[string]string{"plugin/manifest.json": `{"kind":"plugin","id":"legacy-plugin","version":"1.0.0"}`}),
+		},
+		{
+			name: "agent semantic archive",
+			path: "/api/v1/admin/agents/publish",
+			req: PublishRequest{
+				ID:          "legacy-agent",
+				Version:     "1.0.0",
+				ArchiveType: "agent",
+			},
+			archive: tarGz(t, map[string]string{"agent/agent.yml": "name: Legacy\n"}),
+		},
+		{
+			name: "sandbox template semantic archive",
+			path: "/api/v1/admin/sandbox-images/publish",
+			req: PublishRequest{
+				ID:          "legacy-sandbox",
+				Version:     "1.0.0",
+				ArchiveType: "sandbox-template",
+			},
+			archive: tarGz(t, map[string]string{"sandbox/environment.json": `{"name":"legacy","image_repository":"python","image_tag":"3.12"}`}),
+		},
+		{
+			name: "pet tar.gz",
+			path: "/api/v1/admin/pets/publish",
+			req: PublishRequest{
+				ID:          "legacy-pet",
+				Version:     "1.0.0",
+				ArchiveType: "tar.gz",
+			},
+			archive: tarGz(t, map[string]string{"pet/pet.json": `{"id":"legacy-pet","version":"1.0.0"}`, "pet/pet-idle.png": "png"}),
+		},
+		{
+			name: "cli tar.gz",
+			path: "/api/v1/admin/cli-tools/publish",
+			req: PublishRequest{
+				ID:          "legacy-cli",
+				Version:     "1.0.0",
+				ArchiveType: "tar.gz",
+			},
+			archive: tarGz(t, map[string]string{"bin/legacy": "#!/bin/sh\n"}),
+		},
+		{
+			name: "website semantic archive",
+			path: "/api/v1/admin/webapps/publish",
+			req: PublishRequest{
+				ID:          "legacy-webapp",
+				Version:     "1.0.0",
+				WebsiteKind: WebsiteKindLocalApp,
+				ArchiveType: "website-app",
+			},
+			archive: tarGz(t, map[string]string{"app/website.json": `{"id":"legacy-webapp","version":"1.0.0"}`}),
+		},
+	}
+
+	for _, tc := range cases {
+		rec := publishMultipartRecordAt(t, handler, tc.path, tc.req, tc.archive)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400 body=%s", tc.name, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), `"code":"invalid_artifact"`) {
+			t.Fatalf("%s error = %s, want invalid_artifact", tc.name, rec.Body.String())
+		}
+	}
+}
+
+func TestContainerImageArtifactAcceptsTarGzAlias(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	publishMultipartAt(t, handler, "/api/v1/admin/sandbox-images/publish", PublishRequest{
+		ID:          "runtime-image",
+		Name:        "Runtime Image",
+		Version:     "1.0.0",
+		SandboxKind: SandboxKindContainerImage,
+		PlatformKey: "darwin-arm64",
+		ArchiveType: "container-image",
+	}, tarGz(t, map[string]string{"image/manifest.json": `{"image":"runtime:1.0.0"}`}), http.StatusOK)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sandbox-images/runtime-image/resolve?platform=darwin-arm64", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resolved ResolveResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resolved); err != nil {
+		t.Fatalf("decode resolve: %v", err)
+	}
+	if resolved.Asset == nil || resolved.Asset.ArchiveType != "tar.gz" || !strings.HasSuffix(resolved.Asset.URL, ".tar.gz") {
+		t.Fatalf("container image asset = %+v, want tar.gz URL", resolved.Asset)
+	}
+	if resolved.Platform != "darwin-arm64" {
+		t.Fatalf("resolved platform = %q, want darwin-arm64", resolved.Platform)
+	}
+}
+
 func TestValidatorsRejectInvalidProtocolsAndArtifacts(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
@@ -518,14 +658,14 @@ func TestValidatorsRejectInvalidProtocolsAndArtifacts(t *testing.T) {
 	publishMultipartAt(t, handler, "/api/v1/admin/agents/publish", PublishRequest{
 		ID:          "bad-agent",
 		Version:     "1.0.0",
-		ArchiveType: "agent",
-	}, tarGz(t, map[string]string{"agent/readme.md": "missing manifest"}), http.StatusBadRequest)
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"agent/readme.md": "missing manifest"}), http.StatusBadRequest)
 
 	publishMultipartAt(t, handler, "/api/v1/admin/plugins/publish", PublishRequest{
 		ID:          "expected-plugin",
 		Version:     "1.0.0",
-		ArchiveType: "tar.gz",
-	}, tarGz(t, map[string]string{"plugin/manifest.json": `{"kind":"plugin","id":"other-plugin","version":"1.0.0"}`}), http.StatusBadRequest)
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"plugin/manifest.json": `{"kind":"plugin","id":"other-plugin","version":"1.0.0"}`}), http.StatusBadRequest)
 
 	publishMultipartAt(t, handler, "/api/v1/admin/pets/publish", PublishRequest{
 		ID:          "bad-pet",
@@ -537,8 +677,8 @@ func TestValidatorsRejectInvalidProtocolsAndArtifacts(t *testing.T) {
 		ID:          "bad-local",
 		Version:     "1.0.0",
 		WebsiteKind: WebsiteKindLocalApp,
-		ArchiveType: "website-app",
-	}, tarGz(t, map[string]string{"app/index.html": "<h1>Missing manifest</h1>"}), http.StatusBadRequest)
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"app/index.html": "<h1>Missing manifest</h1>"}), http.StatusBadRequest)
 }
 
 func TestNormalizeItemTypeAliases(t *testing.T) {
@@ -570,6 +710,14 @@ func publishMultipart(t *testing.T, handler http.Handler, metadata PublishReques
 
 func publishMultipartAt(t *testing.T, handler http.Handler, path string, metadata PublishRequest, archive []byte, wantStatus int) {
 	t.Helper()
+	rec := publishMultipartRecordAt(t, handler, path, metadata, archive)
+	if rec.Code != wantStatus {
+		t.Fatalf("publish %s status = %d, want %d body=%s", path, rec.Code, wantStatus, rec.Body.String())
+	}
+}
+
+func publishMultipartRecordAt(t *testing.T, handler http.Handler, path string, metadata PublishRequest, archive []byte) *httptest.ResponseRecorder {
+	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	rawMetadata, _ := json.Marshal(metadata)
@@ -589,9 +737,7 @@ func publishMultipartAt(t *testing.T, handler http.Handler, path string, metadat
 	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != wantStatus {
-		t.Fatalf("publish %s status = %d, want %d body=%s", path, rec.Code, wantStatus, rec.Body.String())
-	}
+	return rec
 }
 
 func publishJSON(t *testing.T, handler http.Handler, path string, metadata PublishRequest, wantStatus int) {

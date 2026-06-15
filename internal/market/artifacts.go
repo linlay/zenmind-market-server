@@ -135,11 +135,37 @@ func saveAndValidateArtifact(root, publicBaseURL string, req PublishRequest, fil
 }
 
 func validateArtifactByType(filePath string, req PublishRequest) error {
+	if err := validateArchiveTypeContract(req); err != nil {
+		return err
+	}
 	validator, ok := artifactValidators[req.Type]
 	if !ok {
 		return fmt.Errorf("unsupported item type %q", req.Type)
 	}
 	return validator(filePath, req)
+}
+
+func validateArchiveTypeContract(req PublishRequest) error {
+	if req.Type == TypeSandboxImage {
+		switch req.SandboxKind {
+		case SandboxKindContainerImage:
+			if req.ArchiveType != "tar.gz" {
+				return fmt.Errorf("sandbox-image container-image artifact must use tar.gz, got %q", req.ArchiveType)
+			}
+			return nil
+		case SandboxKindEnvironment:
+			if req.ArchiveType != "zip" {
+				return fmt.Errorf("sandbox-image environment-template artifact must use zip, got %q", req.ArchiveType)
+			}
+			return nil
+		default:
+			return fmt.Errorf("unsupported sandboxKind %q", req.SandboxKind)
+		}
+	}
+	if req.ArchiveType != "zip" {
+		return fmt.Errorf("%s artifact must use zip, got %q", req.Type, req.ArchiveType)
+	}
+	return nil
 }
 
 var artifactValidators = map[ItemType]func(string, PublishRequest) error{
@@ -603,35 +629,25 @@ func sanitizePlatform(value string) string {
 
 func normalizeArchiveType(value string, itemType ItemType, sandboxKind, websiteKind string) string {
 	value = strings.TrimSpace(strings.ToLower(value))
-	switch value {
-	case "tar.gz", "tgz", "zip", "skill", "md", "agent", "sandbox-template", "container-image", "pet", "website-app":
-		if value == "tgz" {
+	if value != "" {
+		switch value {
+		case "tgz":
 			return "tar.gz"
+		case "container-image":
+			if itemType == TypeSandboxImage && sandboxKind == SandboxKindContainerImage {
+				return "tar.gz"
+			}
+			return value
+		case "tar.gz", "zip", "skill", "md", "agent", "sandbox-template", "pet", "website-app":
+			return value
+		default:
+			return value
 		}
-		return value
 	}
-	if itemType == TypeSandboxImage {
-		if sandboxKind == SandboxKindContainerImage {
-			return "container-image"
-		}
-		return "sandbox-template"
-	}
-	if itemType == TypeSkill {
+	if itemType == TypeSandboxImage && sandboxKind == SandboxKindContainerImage {
 		return "tar.gz"
 	}
-	if itemType == TypeAgent {
-		return "agent"
-	}
-	if itemType == TypePet {
-		return "zip"
-	}
-	if itemType == TypeWebsiteApp {
-		if websiteKind == WebsiteKindExternal {
-			return "tar.gz"
-		}
-		return "website-app"
-	}
-	return "tar.gz"
+	return "zip"
 }
 
 func artifactExtension(archiveType, filename string) string {

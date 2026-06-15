@@ -116,6 +116,7 @@ func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
 			Name:              public.Name,
 			Version:           public.Version,
 			Description:       public.Description,
+			Readme:            public.Readme,
 			Tags:              public.Tags,
 			MinDesktopVersion: public.MinDesktopVersion,
 			SandboxKind:       public.SandboxKind,
@@ -126,6 +127,8 @@ func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
 			Install:           public.Install,
 			Uninstall:         public.Uninstall,
 			Detect:            public.Detect,
+			PublishedAt:       public.PublishedAt,
+			UpdatedAt:         public.UpdatedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -303,6 +306,10 @@ func (a *App) handlePublishWithType(w http.ResponseWriter, r *http.Request, forc
 		writeError(w, http.StatusBadRequest, "invalid_artifact", err.Error())
 		return
 	}
+	if err := validateArchiveTypeContract(req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_artifact", err.Error())
+		return
+	}
 	if err := a.store.Publish(r.Context(), req, artifact); err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
@@ -472,13 +479,13 @@ func marketRouteDefinitions() []marketRoute {
 
 func marketInfos() []MarketInfo {
 	archiveTypes := map[ItemType][]string{
-		TypeSkill:        {"tar.gz", "zip", "skill", "md"},
-		TypePlugin:       {"tar.gz", "zip"},
-		TypeAgent:        {"agent", "tar.gz", "zip"},
-		TypeSandboxImage: {"sandbox-template", "container-image", "tar.gz", "zip"},
+		TypeSkill:        {"zip"},
+		TypePlugin:       {"zip"},
+		TypeAgent:        {"zip"},
+		TypeSandboxImage: {"zip", "tar.gz"},
 		TypePet:          {"zip"},
-		TypeCLITool:      {"tar.gz", "zip"},
-		TypeWebsiteApp:   {"website-app", "zip", "tar.gz"},
+		TypeCLITool:      {"zip"},
+		TypeWebsiteApp:   {"zip"},
 	}
 	names := map[ItemType]string{
 		TypeSkill:        "Skill Market",

@@ -165,6 +165,7 @@ type DesktopCatalogItem struct {
 	Name              string                 `json:"name"`
 	Version           string                 `json:"version"`
 	Description       string                 `json:"description"`
+	Readme            string                 `json:"readme,omitempty"`
 	Tags              []string               `json:"tags"`
 	MinDesktopVersion string                 `json:"minDesktopVersion,omitempty"`
 	SandboxKind       string                 `json:"sandboxKind,omitempty"`
@@ -175,6 +176,8 @@ type DesktopCatalogItem struct {
 	Install           *MarketScriptSpec      `json:"install,omitempty"`
 	Uninstall         *MarketScriptSpec      `json:"uninstall,omitempty"`
 	Detect            *MarketDetectSpec      `json:"detect,omitempty"`
+	PublishedAt       time.Time              `json:"publishedAt"`
+	UpdatedAt         time.Time              `json:"updatedAt"`
 }
 
 type DesktopCatalogResponse struct {
