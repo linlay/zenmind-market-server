@@ -27,7 +27,7 @@ func OpenStore(ctx context.Context, databasePath string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(4)
+	db.SetMaxOpenConns(8)
 	store := &Store{db: db}
 	if err := store.migrate(ctx); err != nil {
 		_ = db.Close()
@@ -303,17 +303,21 @@ func (s *Store) ListPublic(ctx context.Context, onlyType ItemType) ([]storedItem
 		if err := decodeItemJSON(&item, metadataJSON, dependenciesJSON, protocolJSON); err != nil {
 			return nil, err
 		}
-		item.Tags, err = s.tags(ctx, item.Type, item.ID)
-		if err != nil {
-			return nil, err
-		}
-		item.Assets, err = s.assets(ctx, item.Type, item.ID, item.LatestVersion)
-		if err != nil {
-			return nil, err
-		}
 		items = append(items, item)
 	}
-	return items, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := s.loadTagsForItems(ctx, items, onlyType); err != nil {
+		return nil, err
+	}
+	if err := s.loadAssetsForItems(ctx, items, onlyType); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 func (s *Store) GetPublic(ctx context.Context, itemType ItemType, id string) (storedItem, error) {
@@ -393,13 +397,18 @@ func (s *Store) ListVersions(ctx context.Context, itemType ItemType, id string) 
 		if version.Dependencies == nil {
 			version.Dependencies = []MarketDependency{}
 		}
-		version.Assets, err = s.assets(ctx, itemType, id, version.Version)
-		if err != nil {
-			return nil, err
-		}
 		versions = append(versions, version)
 	}
-	return versions, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := s.loadAssetsForVersions(ctx, itemType, id, versions); err != nil {
+		return nil, err
+	}
+	return versions, nil
 }
 
 func (s *Store) tags(ctx context.Context, itemType ItemType, id string) ([]string, error) {
@@ -440,6 +449,130 @@ func (s *Store) assets(ctx context.Context, itemType ItemType, id, version strin
 		assets[key] = asset
 	}
 	return assets, rows.Err()
+}
+
+type itemLookupKey struct {
+	itemType ItemType
+	id       string
+}
+
+type versionLookupKey struct {
+	itemType ItemType
+	id       string
+	version  string
+}
+
+func (s *Store) loadTagsForItems(ctx context.Context, items []storedItem, onlyType ItemType) error {
+	if len(items) == 0 {
+		return nil
+	}
+	index := make(map[itemLookupKey]int, len(items))
+	for i := range items {
+		index[itemLookupKey{itemType: items[i].Type, id: items[i].ID}] = i
+	}
+	query := `SELECT t.item_type, t.item_id, t.tag
+		FROM tags t
+		JOIN items i ON i.type = t.item_type AND i.id = t.item_id
+		WHERE i.published = 1`
+	args := []any{}
+	if onlyType != "" {
+		query += ` AND i.type = ?`
+		args = append(args, onlyType)
+	}
+	query += ` ORDER BY t.item_type, t.item_id, t.tag COLLATE NOCASE`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rawType, id, tag string
+		if err := rows.Scan(&rawType, &id, &tag); err != nil {
+			return err
+		}
+		if itemIndex, ok := index[itemLookupKey{itemType: ItemType(rawType), id: id}]; ok {
+			items[itemIndex].Tags = append(items[itemIndex].Tags, tag)
+		}
+	}
+	return rows.Err()
+}
+
+func (s *Store) loadAssetsForItems(ctx context.Context, items []storedItem, onlyType ItemType) error {
+	if len(items) == 0 {
+		return nil
+	}
+	index := make(map[versionLookupKey]int, len(items))
+	for i := range items {
+		items[i].Assets = map[string]PublicAsset{}
+		index[versionLookupKey{itemType: items[i].Type, id: items[i].ID, version: items[i].LatestVersion}] = i
+	}
+	query := `SELECT a.item_type, a.item_id, a.version, a.platform_key, a.archive_type, a.asset_role, a.url, a.sha256, a.integrity, a.size_bytes
+		FROM artifacts a
+		JOIN items i ON i.type = a.item_type AND i.id = a.item_id AND i.latest_version = a.version
+		WHERE i.published = 1`
+	args := []any{}
+	if onlyType != "" {
+		query += ` AND i.type = ?`
+		args = append(args, onlyType)
+	}
+	query += ` ORDER BY a.item_type, a.item_id, a.version, a.asset_role, a.platform_key`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rawType, id, version, platformKey string
+		var asset PublicAsset
+		if err := rows.Scan(&rawType, &id, &version, &platformKey, &asset.ArchiveType, &asset.Role, &asset.URL, &asset.SHA256, &asset.Integrity, &asset.SizeBytes); err != nil {
+			return err
+		}
+		itemIndex, ok := index[versionLookupKey{itemType: ItemType(rawType), id: id, version: version}]
+		if !ok {
+			continue
+		}
+		assignAsset(items[itemIndex].Assets, platformKey, asset)
+	}
+	return rows.Err()
+}
+
+func (s *Store) loadAssetsForVersions(ctx context.Context, itemType ItemType, id string, versions []PublicVersion) error {
+	if len(versions) == 0 {
+		return nil
+	}
+	index := make(map[string]int, len(versions))
+	for i := range versions {
+		versions[i].Assets = map[string]PublicAsset{}
+		index[versions[i].Version] = i
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT version, platform_key, archive_type, asset_role, url, sha256, integrity, size_bytes
+		FROM artifacts WHERE item_type = ? AND item_id = ? ORDER BY version, asset_role, platform_key`, itemType, id)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var version, platformKey string
+		var asset PublicAsset
+		if err := rows.Scan(&version, &platformKey, &asset.ArchiveType, &asset.Role, &asset.URL, &asset.SHA256, &asset.Integrity, &asset.SizeBytes); err != nil {
+			return err
+		}
+		versionIndex, ok := index[version]
+		if !ok {
+			continue
+		}
+		assignAsset(versions[versionIndex].Assets, platformKey, asset)
+	}
+	return rows.Err()
+}
+
+func assignAsset(assets map[string]PublicAsset, platformKey string, asset PublicAsset) {
+	asset.Platform = platformKey
+	key := platformKey
+	if asset.Role != "" && asset.Role != AssetRolePrimary {
+		key = asset.Role
+	}
+	assets[key] = asset
 }
 
 type protocolRecord struct {

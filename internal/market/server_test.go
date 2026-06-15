@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -14,7 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func newTestApp(t *testing.T) *App {
@@ -165,6 +168,121 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusFound || rec.Header().Get("Location") == "" {
 		t.Fatalf("download status = %d location=%q body=%s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
+	}
+}
+
+func TestCatalogHandlesConcurrentRequests(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	const itemCount = 10
+	for i := 0; i < itemCount; i++ {
+		id := fmt.Sprintf("demo-%02d", i)
+		publishMultipart(t, handler, PublishRequest{
+			Type:        TypeSkill,
+			ID:          id,
+			Name:        "Demo " + id,
+			Version:     "1.0.0",
+			Tags:        []string{"batch", id},
+			ArchiveType: "zip",
+		}, zipArchive(t, map[string]string{id + "/SKILL.md": "# " + id + "\n"}))
+	}
+
+	const concurrency = 16
+	var wg sync.WaitGroup
+	errs := make(chan string, concurrency)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/catalog", nil).WithContext(ctx)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				errs <- fmt.Sprintf("request %d status = %d body=%s", index, rec.Code, rec.Body.String())
+				return
+			}
+			var catalog CatalogResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &catalog); err != nil {
+				errs <- fmt.Sprintf("request %d decode catalog: %v", index, err)
+				return
+			}
+			if len(catalog.Items) != itemCount {
+				errs <- fmt.Sprintf("request %d catalog item count = %d, want %d", index, len(catalog.Items), itemCount)
+				return
+			}
+			for _, item := range catalog.Items {
+				if len(item.Tags) == 0 {
+					errs <- fmt.Sprintf("request %d item %s missing tags", index, item.ID)
+					return
+				}
+				if item.Assets["universal"].SHA256 == "" {
+					errs <- fmt.Sprintf("request %d item %s missing universal asset", index, item.ID)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func TestVersionsHandlesConcurrentRequests(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	for _, version := range []string{"1.0.0", "2.0.0"} {
+		publishMultipart(t, handler, PublishRequest{
+			Type:        TypeSkill,
+			ID:          "versioned",
+			Name:        "Versioned Skill",
+			Version:     version,
+			ArchiveType: "zip",
+		}, zipArchive(t, map[string]string{"versioned/SKILL.md": "# Version " + version + "\n"}))
+	}
+
+	const concurrency = 16
+	var wg sync.WaitGroup
+	errs := make(chan string, concurrency)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/skills/versioned/versions", nil).WithContext(ctx)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				errs <- fmt.Sprintf("request %d status = %d body=%s", index, rec.Code, rec.Body.String())
+				return
+			}
+			var response VersionsResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				errs <- fmt.Sprintf("request %d decode versions: %v", index, err)
+				return
+			}
+			if len(response.Versions) != 2 {
+				errs <- fmt.Sprintf("request %d version count = %d, want 2", index, len(response.Versions))
+				return
+			}
+			for _, version := range response.Versions {
+				if version.Assets["universal"].SHA256 == "" {
+					errs <- fmt.Sprintf("request %d version %s missing universal asset", index, version.Version)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }
 
