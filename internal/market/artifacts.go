@@ -173,15 +173,19 @@ func validatePluginArtifact(filePath string, req PublishRequest) error {
 		return errors.New("plugin artifact must contain manifest.json")
 	}
 	var manifest struct {
-		ID      string `json:"id"`
-		Kind    string `json:"kind"`
-		Version string `json:"version"`
+		ID               string `json:"id"`
+		Kind             string `json:"kind"`
+		PluginAPIVersion int    `json:"pluginApiVersion"`
+		Version          string `json:"version"`
 	}
 	if err := json.Unmarshal(content, &manifest); err != nil {
 		return fmt.Errorf("plugin manifest is invalid JSON: %w", err)
 	}
-	if manifest.Kind != "plugin" {
-		return errors.New("plugin manifest must declare kind=plugin")
+	if manifest.Kind != "" && manifest.Kind != "plugin" {
+		return errors.New("plugin manifest kind must be plugin")
+	}
+	if manifest.Kind == "" && manifest.PluginAPIVersion == 0 {
+		return errors.New("plugin manifest must declare kind=plugin or pluginApiVersion")
 	}
 	if manifest.ID == "" || sanitizeSlug(manifest.ID) != req.ID {
 		return fmt.Errorf("plugin manifest id mismatch: expected %s, got %s", req.ID, manifest.ID)

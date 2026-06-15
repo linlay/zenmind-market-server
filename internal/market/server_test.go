@@ -478,6 +478,17 @@ func TestExternalWebsiteAndCLIJsonPublish(t *testing.T) {
 	}
 }
 
+func TestPluginValidatorAcceptsPluginAPIVersionManifest(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	publishMultipartAt(t, handler, "/api/v1/admin/plugins/publish", PublishRequest{
+		ID:          "calendar",
+		Version:     "v0.1.0",
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"calendar/manifest.json": `{"pluginApiVersion":1,"id":"calendar","version":"v0.1.0"}`}), http.StatusOK)
+}
+
 func TestValidatorsRejectInvalidProtocolsAndArtifacts(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
