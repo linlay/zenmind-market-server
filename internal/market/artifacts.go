@@ -43,7 +43,7 @@ func validatePublishRequest(req *PublishRequest) error {
 	if req.ID == "" || !safeIDPattern.MatchString(req.ID) {
 		return errors.New("id must contain only lowercase letters, numbers, dot, underscore, or dash")
 	}
-	req.Version = strings.TrimSpace(req.Version)
+	req.Version = canonicalVersion(req.Version)
 	if req.Version == "" {
 		return errors.New("version is required")
 	}
@@ -268,7 +268,7 @@ func validatePluginArtifact(filePath string, req PublishRequest) error {
 	if manifest.ID == "" || sanitizeSlug(manifest.ID) != req.ID {
 		return fmt.Errorf("plugin manifest id mismatch: expected %s, got %s", req.ID, manifest.ID)
 	}
-	if strings.TrimSpace(manifest.Version) != "" && strings.TrimSpace(manifest.Version) != req.Version {
+	if canonicalVersion(manifest.Version) != "" && canonicalVersion(manifest.Version) != req.Version {
 		return fmt.Errorf("plugin manifest version mismatch: expected %s, got %s", req.Version, manifest.Version)
 	}
 	return nil
@@ -343,7 +343,7 @@ func validatePetArtifact(filePath string, req PublishRequest) error {
 	if manifest.ID != "" && sanitizeSlug(manifest.ID) != req.ID {
 		return fmt.Errorf("pet manifest id mismatch: expected %s, got %s", req.ID, manifest.ID)
 	}
-	if strings.TrimSpace(manifest.Version) != "" && strings.TrimSpace(manifest.Version) != req.Version {
+	if canonicalVersion(manifest.Version) != "" && canonicalVersion(manifest.Version) != req.Version {
 		return fmt.Errorf("pet manifest version mismatch: expected %s, got %s", req.Version, manifest.Version)
 	}
 	return nil
@@ -377,7 +377,7 @@ func validateWebsiteAppArtifact(filePath string, req PublishRequest) error {
 	if manifest.ID != "" && sanitizeSlug(manifest.ID) != req.ID {
 		return fmt.Errorf("website manifest id mismatch: expected %s, got %s", req.ID, manifest.ID)
 	}
-	if strings.TrimSpace(manifest.Version) != "" && strings.TrimSpace(manifest.Version) != req.Version {
+	if canonicalVersion(manifest.Version) != "" && canonicalVersion(manifest.Version) != req.Version {
 		return fmt.Errorf("website manifest version mismatch: expected %s, got %s", req.Version, manifest.Version)
 	}
 	return nil

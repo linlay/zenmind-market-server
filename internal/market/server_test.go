@@ -175,6 +175,186 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	}
 }
 
+func TestVersionCanonicalizationAtAPIBoundaries(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	rec := publishMultipartRecordAt(t, handler, "/api/v1/admin/plugins/publish", PublishRequest{
+		ID:          "calendar",
+		Name:        "Calendar",
+		Version:     "v1.0.0",
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"plugin/manifest.json": `{"kind":"plugin","id":"calendar","version":"v1.0.0"}`}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"version":"1.0.0"`) {
+		t.Fatalf("publish response did not return canonical version: %s", rec.Body.String())
+	}
+
+	publishMultipartAt(t, handler, "/api/v1/admin/pets/publish", PublishRequest{
+		ID:          "spark",
+		Name:        "Spark",
+		Version:     "v2.0.0",
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"spark/pet.json": `{"id":"spark","version":"2.0.0"}`, "spark/pet-idle.png": "png"}), http.StatusOK)
+
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/plugins/calendar", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("item status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var item PublicItem
+	if err := json.Unmarshal(rec.Body.Bytes(), &item); err != nil {
+		t.Fatalf("decode item: %v", err)
+	}
+	if item.Version != "1.0.0" {
+		t.Fatalf("item version = %q, want 1.0.0", item.Version)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/plugins/calendar/versions", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("versions status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var versions VersionsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &versions); err != nil {
+		t.Fatalf("decode versions: %v", err)
+	}
+	if len(versions.Versions) != 1 || versions.Versions[0].Version != "1.0.0" {
+		t.Fatalf("versions = %+v, want canonical 1.0.0", versions.Versions)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/plugins/calendar/resolve?version=v1.0.0", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resolved ResolveResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resolved); err != nil {
+		t.Fatalf("decode resolve: %v", err)
+	}
+	if resolved.Version != "1.0.0" || resolved.Asset == nil {
+		t.Fatalf("resolve = %+v, want canonical version with asset", resolved)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/plugins/calendar/download?version=V1.0.0", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("download status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var recordedVersion string
+	if err := app.store.db.QueryRowContext(context.Background(), `SELECT version FROM download_events WHERE item_type = ? AND item_id = ?`, TypePlugin, "calendar").Scan(&recordedVersion); err != nil {
+		t.Fatalf("download event query: %v", err)
+	}
+	if recordedVersion != "1.0.0" {
+		t.Fatalf("download event version = %q, want 1.0.0", recordedVersion)
+	}
+
+	rawUnpublish, _ := json.Marshal(map[string]string{"type": "plugin", "id": "calendar", "version": "v1.0.0"})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", bytes.NewReader(rawUnpublish))
+	req.Header.Set("Authorization", "Bearer secret")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unpublish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCanonicalizeStoredVersionsMigratesLegacyRows(t *testing.T) {
+	app := newTestApp(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	_, err := app.store.db.ExecContext(ctx, `INSERT INTO items (
+		type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, metadata_json, dependencies_json, protocol_json, published, published_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		TypeSkill, "legacy", "Legacy Skill", "Legacy description", "# Legacy", "v1.0.0", "", "", "", "{}", "[]", "{}", now, now)
+	if err != nil {
+		t.Fatalf("insert item: %v", err)
+	}
+	_, err = app.store.db.ExecContext(ctx, `INSERT INTO versions (
+		item_type, item_id, version, description, readme, metadata_json, dependencies_json, protocol_json, published, published_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		TypeSkill, "legacy", "1.0.0", "Canonical version", "# Canonical", "{}", "[]", "{}", now)
+	if err != nil {
+		t.Fatalf("insert canonical version: %v", err)
+	}
+	_, err = app.store.db.ExecContext(ctx, `INSERT INTO versions (
+		item_type, item_id, version, description, readme, metadata_json, dependencies_json, protocol_json, published, published_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		TypeSkill, "legacy", "v1.0.0", "Legacy version", "# Legacy", "{}", "[]", "{}", now)
+	if err != nil {
+		t.Fatalf("insert legacy version: %v", err)
+	}
+	_, err = app.store.db.ExecContext(ctx, `INSERT INTO artifacts (
+		item_type, item_id, version, platform_key, archive_type, asset_role, path, url, sha256, integrity, size_bytes, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		TypeSkill, "legacy", "v1.0.0", "universal", "zip", AssetRolePrimary, "/tmp/legacy.zip", "http://market.test/artifacts/skill/legacy/v1.0.0/universal.zip", "sha", "integrity", 12, now)
+	if err != nil {
+		t.Fatalf("insert legacy artifact: %v", err)
+	}
+	_, err = app.store.db.ExecContext(ctx, `INSERT INTO version_platforms (
+		item_type, item_id, version, platform_key, os, arch, description, readme, min_desktop_version, metadata_json, dependencies_json, protocol_json, published, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		TypeSkill, "legacy", "v1.0.0", "universal", "", "", "Legacy platform", "", "", "{}", "[]", "{}", now, now)
+	if err != nil {
+		t.Fatalf("insert legacy platform: %v", err)
+	}
+	_, err = app.store.db.ExecContext(ctx, `INSERT INTO download_events (
+		item_type, item_id, version, artifact_platform, user_agent, ip, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?)`, TypeSkill, "legacy", "v1.0.0", "universal", "test", "127.0.0.1", now)
+	if err != nil {
+		t.Fatalf("insert legacy download: %v", err)
+	}
+
+	if err := app.store.canonicalizeStoredVersions(ctx); err != nil {
+		t.Fatalf("canonicalizeStoredVersions: %v", err)
+	}
+
+	var legacyVersionRows int
+	if err := app.store.db.QueryRowContext(ctx, `SELECT count(*) FROM versions WHERE item_type = ? AND item_id = ? AND version = ?`, TypeSkill, "legacy", "v1.0.0").Scan(&legacyVersionRows); err != nil {
+		t.Fatalf("count legacy versions: %v", err)
+	}
+	if legacyVersionRows != 0 {
+		t.Fatalf("legacy version rows = %d, want 0", legacyVersionRows)
+	}
+
+	item, err := app.store.GetPublic(ctx, TypeSkill, "legacy", "")
+	if err != nil {
+		t.Fatalf("GetPublic: %v", err)
+	}
+	public := publicItem(item)
+	if public.Version != "1.0.0" {
+		t.Fatalf("public version = %q, want 1.0.0", public.Version)
+	}
+	asset := public.Assets["universal"]
+	if asset.URL != "http://market.test/artifacts/skill/legacy/v1.0.0/universal.zip" {
+		t.Fatalf("asset URL = %q, want legacy path preserved", asset.URL)
+	}
+	if _, ok := public.Platforms["universal"]; !ok {
+		t.Fatalf("platforms missing universal: %+v", public.Platforms)
+	}
+	artifact, err := app.store.GetArtifact(ctx, TypeSkill, "legacy", "v1.0.0", "universal")
+	if err != nil {
+		t.Fatalf("GetArtifact with legacy input: %v", err)
+	}
+	if artifact.Version != "1.0.0" {
+		t.Fatalf("artifact version = %q, want 1.0.0", artifact.Version)
+	}
+	var eventVersion string
+	if err := app.store.db.QueryRowContext(ctx, `SELECT version FROM download_events WHERE item_type = ? AND item_id = ?`, TypeSkill, "legacy").Scan(&eventVersion); err != nil {
+		t.Fatalf("download event query: %v", err)
+	}
+	if eventVersion != "1.0.0" {
+		t.Fatalf("download event version = %q, want 1.0.0", eventVersion)
+	}
+}
+
 func TestPublicItemStatsAndDownloadCount(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()

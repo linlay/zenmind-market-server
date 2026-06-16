@@ -231,7 +231,7 @@ func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemTy
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	version := strings.TrimSpace(r.URL.Query().Get("version"))
+	version := canonicalVersion(r.URL.Query().Get("version"))
 	if version == "" {
 		version = item.LatestVersion
 	}
@@ -391,7 +391,7 @@ func (a *App) handleUnpublish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
 		return
 	}
-	if err := a.store.Unpublish(r.Context(), itemType, sanitizeSlug(req.ID), strings.TrimSpace(req.Version)); err != nil {
+	if err := a.store.Unpublish(r.Context(), itemType, sanitizeSlug(req.ID), canonicalVersion(req.Version)); err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
@@ -439,6 +439,7 @@ func (a *App) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) downloadArtifact(w http.ResponseWriter, r *http.Request, itemType ItemType, id, version, platform string) {
+	version = canonicalVersion(version)
 	artifact, err := a.store.GetArtifact(r.Context(), itemType, id, version, platform)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "not_found", "artifact not found")

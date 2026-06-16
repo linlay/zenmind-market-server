@@ -170,10 +170,107 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.canonicalizeStoredVersions(ctx); err != nil {
+		return err
+	}
 	if err := s.backfillVersionPlatforms(ctx); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (s *Store) canonicalizeStoredVersions(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	statements := []string{
+		`DELETE FROM versions
+			WHERE substr(version, 1, 1) IN ('v', 'V')
+				AND substr(version, 2, 1) BETWEEN '0' AND '9'
+				AND (
+					EXISTS (
+						SELECT 1 FROM versions canonical
+						WHERE canonical.item_type = versions.item_type
+							AND canonical.item_id = versions.item_id
+							AND canonical.version = substr(versions.version, 2)
+					)
+					OR rowid NOT IN (
+						SELECT min(rowid) FROM versions
+						WHERE substr(version, 1, 1) IN ('v', 'V')
+							AND substr(version, 2, 1) BETWEEN '0' AND '9'
+						GROUP BY item_type, item_id, substr(version, 2)
+					)
+				)`,
+		`UPDATE versions
+			SET version = substr(version, 2)
+			WHERE substr(version, 1, 1) IN ('v', 'V')
+				AND substr(version, 2, 1) BETWEEN '0' AND '9'`,
+		`DELETE FROM artifacts
+			WHERE substr(version, 1, 1) IN ('v', 'V')
+				AND substr(version, 2, 1) BETWEEN '0' AND '9'
+				AND (
+					EXISTS (
+						SELECT 1 FROM artifacts canonical
+						WHERE canonical.item_type = artifacts.item_type
+							AND canonical.item_id = artifacts.item_id
+							AND canonical.version = substr(artifacts.version, 2)
+							AND canonical.platform_key = artifacts.platform_key
+					)
+					OR rowid NOT IN (
+						SELECT min(rowid) FROM artifacts
+						WHERE substr(version, 1, 1) IN ('v', 'V')
+							AND substr(version, 2, 1) BETWEEN '0' AND '9'
+						GROUP BY item_type, item_id, substr(version, 2), platform_key
+					)
+				)`,
+		`UPDATE artifacts
+			SET version = substr(version, 2)
+			WHERE substr(version, 1, 1) IN ('v', 'V')
+				AND substr(version, 2, 1) BETWEEN '0' AND '9'`,
+		`DELETE FROM version_platforms
+			WHERE substr(version, 1, 1) IN ('v', 'V')
+				AND substr(version, 2, 1) BETWEEN '0' AND '9'
+				AND (
+					EXISTS (
+						SELECT 1 FROM version_platforms canonical
+						WHERE canonical.item_type = version_platforms.item_type
+							AND canonical.item_id = version_platforms.item_id
+							AND canonical.version = substr(version_platforms.version, 2)
+							AND canonical.platform_key = version_platforms.platform_key
+					)
+					OR rowid NOT IN (
+						SELECT min(rowid) FROM version_platforms
+						WHERE substr(version, 1, 1) IN ('v', 'V')
+							AND substr(version, 2, 1) BETWEEN '0' AND '9'
+						GROUP BY item_type, item_id, substr(version, 2), platform_key
+					)
+				)`,
+		`UPDATE version_platforms
+			SET version = substr(version, 2)
+			WHERE substr(version, 1, 1) IN ('v', 'V')
+				AND substr(version, 2, 1) BETWEEN '0' AND '9'`,
+		`UPDATE download_events
+			SET version = substr(version, 2)
+			WHERE substr(version, 1, 1) IN ('v', 'V')
+				AND substr(version, 2, 1) BETWEEN '0' AND '9'`,
+		`UPDATE items
+			SET latest_version = substr(latest_version, 2)
+			WHERE substr(latest_version, 1, 1) IN ('v', 'V')
+				AND substr(latest_version, 2, 1) BETWEEN '0' AND '9'`,
+	}
+	for _, statement := range statements {
+		if _, err = tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	err = tx.Commit()
+	return err
 }
 
 func (s *Store) backfillVersionPlatforms(ctx context.Context) error {
@@ -223,6 +320,7 @@ func (s *Store) ensureColumn(ctx context.Context, table, column, definition stri
 }
 
 func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *storedArtifact) error {
+	req.Version = canonicalVersion(req.Version)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	metadataJSON, err := encodeJSONText(req.Metadata, "{}")
 	if err != nil {
@@ -353,6 +451,7 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 }
 
 func (s *Store) Unpublish(ctx context.Context, itemType ItemType, id, version string) error {
+	version = canonicalVersion(version)
 	if version == "" {
 		_, err := s.db.ExecContext(ctx, `UPDATE items SET published = 0, updated_at = ? WHERE type = ? AND id = ?`, time.Now().UTC().Format(time.RFC3339Nano), itemType, id)
 		return err
@@ -430,6 +529,7 @@ func (s *Store) GetPublic(ctx context.Context, itemType ItemType, id, viewerUser
 }
 
 func (s *Store) GetArtifact(ctx context.Context, itemType ItemType, id, version, platform string) (storedArtifact, error) {
+	version = canonicalVersion(version)
 	if version == "" {
 		row := s.db.QueryRowContext(ctx, `SELECT latest_version FROM items WHERE type = ? AND id = ? AND published = 1`, itemType, id)
 		if err := row.Scan(&version); err != nil {
@@ -460,6 +560,7 @@ func (s *Store) getArtifact(ctx context.Context, itemType ItemType, id, version,
 }
 
 func (s *Store) GetPlatform(ctx context.Context, itemType ItemType, id, version, platform string) (PublicPlatform, error) {
+	version = canonicalVersion(version)
 	if version == "" {
 		row := s.db.QueryRowContext(ctx, `SELECT latest_version FROM items WHERE type = ? AND id = ? AND published = 1`, itemType, id)
 		if err := row.Scan(&version); err != nil {
@@ -494,6 +595,7 @@ func (s *Store) getPlatform(ctx context.Context, itemType ItemType, id, version,
 }
 
 func (s *Store) RecordDownload(ctx context.Context, itemType ItemType, id, version, platform, userAgent, ip string) {
+	version = canonicalVersion(version)
 	_, _ = s.db.ExecContext(ctx, `INSERT INTO download_events (
 		item_type, item_id, version, artifact_platform, user_agent, ip, created_at
 	) VALUES (?, ?, ?, ?, ?, ?, ?)`, itemType, id, version, platform, userAgent, ip, time.Now().UTC().Format(time.RFC3339Nano))
