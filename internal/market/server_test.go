@@ -1323,6 +1323,125 @@ func TestValidatorsRejectInvalidProtocolsAndArtifacts(t *testing.T) {
 	}, zipArchive(t, map[string]string{"app/index.html": "<h1>Missing manifest</h1>"}), http.StatusBadRequest)
 }
 
+func TestADPManifestPublishNormalizeAndEndpoint(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	publishMultipartAt(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
+		ID:          "zmctl",
+		Name:        "ZenMind CLI",
+		Version:     "1.0.0",
+		Description: "CLI",
+		ArchiveType: "zip",
+		Platform: &MarketPlatformSpec{
+			Key:  "darwin-arm64",
+			OS:   "darwin",
+			Arch: "arm64",
+		},
+	}, zipArchive(t, map[string]string{"bin/zmctl": "#!/bin/sh\n"}), http.StatusOK)
+
+	publishMultipartAt(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
+		ID:          "zmctl",
+		Name:        "ZenMind CLI",
+		Version:     "1.0.0",
+		Description: "CLI",
+		ArchiveType: "zip",
+		Platform: &MarketPlatformSpec{
+			Key:  "linux-amd64",
+			OS:   "linux",
+			Arch: "amd64",
+		},
+	}, zipArchive(t, map[string]string{"bin/zmctl": "#!/bin/sh\n"}), http.StatusOK)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/adp/cli-tool/zmctl?version=1.0.0", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("adp status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"macos-arm64:",
+		"linux-x64:",
+		"/api/v1/cli-tools/zmctl/download?version=1.0.0&platform=darwin-arm64",
+		"/api/v1/cli-tools/zmctl/download?version=1.0.0&platform=linux-amd64",
+		"- linux-x64",
+		"- macos-arm64",
+		"sha256:",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("adp manifest missing %q:\n%s", want, body)
+		}
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/catalog?type=cli-tool", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"adpInstallUrl":"/api/v1/adp/cli-tool/zmctl"`) {
+		t.Fatalf("catalog missing adpInstallUrl: %s", rec.Body.String())
+	}
+}
+
+func TestADPPublishRequiresManifestForNewCLIToolAndSkill(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	rawMetadata, _ := json.Marshal(PublishRequest{
+		ID:          "no-adp",
+		Name:        "No ADP",
+		Version:     "1.0.0",
+		ArchiveType: "zip",
+	})
+	_ = writer.WriteField("metadata", string(rawMetadata))
+	part, err := writer.CreateFormFile("artifact", "artifact.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(zipArchive(t, map[string]string{"bin/no-adp": "#!/bin/sh\n"})); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/cli-tools/publish", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"invalid_adp"`) {
+		t.Fatalf("publish without adp status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestADPRejectsManagedPathOutsideADPHome(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	publishMultipartAt(t, handler, "/api/v1/admin/skills/publish", PublishRequest{
+		ID:          "bad-skill-path",
+		Name:        "Bad Skill Path",
+		Version:     "1.0.0",
+		ArchiveType: "zip",
+		ADPYAML: `schema: "0.1"
+name: bad-skill-path-adp
+packages:
+  - id: bad-skill-path
+    version: "1.0.0"
+    x-zenmind-artifact: primary
+    x-adp-managed-paths:
+      - "/tmp/bad-skill-path"
+    hooks:
+      post:
+        - "echo install"
+`,
+	}, zipArchive(t, map[string]string{"bad/SKILL.md": "# Bad\n"}), http.StatusBadRequest)
+}
+
 func TestNormalizeItemTypeAliases(t *testing.T) {
 	cases := map[string]ItemType{
 		"agent":        TypeAgent,
@@ -1386,8 +1505,20 @@ func publishMultipartRecordAt(t *testing.T, handler http.Handler, path string, m
 	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
+	if metadata.ADPYAML == "" {
+		metadata.ADPYAML = testADPYAML(inferTestPublishType(path, metadata.Type), metadata.ID, metadata.Version, true)
+	}
 	rawMetadata, _ := json.Marshal(metadata)
 	_ = writer.WriteField("metadata", string(rawMetadata))
+	if metadata.ADPYAML != "" {
+		adpPart, err := writer.CreateFormFile("adp", "adp.yaml")
+		if err != nil {
+			t.Fatalf("CreateFormFile adp: %v", err)
+		}
+		if _, err := adpPart.Write([]byte(metadata.ADPYAML)); err != nil {
+			t.Fatalf("write adp part: %v", err)
+		}
+	}
 	part, err := writer.CreateFormFile("artifact", "artifact.tar.gz")
 	if err != nil {
 		t.Fatalf("CreateFormFile: %v", err)
@@ -1408,6 +1539,9 @@ func publishMultipartRecordAt(t *testing.T, handler http.Handler, path string, m
 
 func publishJSON(t *testing.T, handler http.Handler, path string, metadata PublishRequest, wantStatus int) {
 	t.Helper()
+	if metadata.ADPYAML == "" {
+		metadata.ADPYAML = testADPYAML(inferTestPublishType(path, metadata.Type), metadata.ID, metadata.Version, false)
+	}
 	rawMetadata, _ := json.Marshal(metadata)
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(rawMetadata))
 	req.Header.Set("Authorization", "Bearer secret")
@@ -1417,6 +1551,63 @@ func publishJSON(t *testing.T, handler http.Handler, path string, metadata Publi
 	if rec.Code != wantStatus {
 		t.Fatalf("publish JSON %s status = %d, want %d body=%s", path, rec.Code, wantStatus, rec.Body.String())
 	}
+}
+
+func inferTestPublishType(path string, itemType ItemType) ItemType {
+	if itemType != "" {
+		return itemType
+	}
+	switch {
+	case strings.Contains(path, "/skills/"):
+		return TypeSkill
+	case strings.Contains(path, "/cli-tools/"):
+		return TypeCLITool
+	}
+	normalized, err := normalizeItemType(path)
+	if err == nil {
+		return normalized
+	}
+	return ""
+}
+
+func testADPYAML(itemType ItemType, id string, version string, hasArtifact bool) string {
+	if itemType != TypeSkill && itemType != TypeCLITool {
+		return ""
+	}
+	id = sanitizeSlug(id)
+	version = canonicalVersion(version)
+	if id == "" {
+		id = "test"
+	}
+	if version == "" {
+		version = "1.0.0"
+	}
+	if !hasArtifact {
+		return fmt.Sprintf("schema: \"0.1\"\nname: %s-adp\npackages:\n  - %s\n", id, id)
+	}
+	if itemType == TypeSkill {
+		return fmt.Sprintf(`schema: "0.1"
+name: %s-adp
+packages:
+  - id: %s
+    version: "%s"
+    x-zenmind-artifact: primary
+    x-adp-managed-paths:
+      - "${ADP_HOME}/zenmind/skills/%s/%s"
+    hooks:
+      post:
+        - "mkdir -p ${ADP_HOME}/zenmind/skills/%s/%s && cp -R ${ADP_PKG_DIR}/. ${ADP_HOME}/zenmind/skills/%s/%s"
+`, id, id, version, id, version, id, version, id, version)
+	}
+	return fmt.Sprintf(`schema: "0.1"
+name: %s-adp
+packages:
+  - id: %s
+    version: "%s"
+    x-zenmind-artifact: primary
+    expose:
+      %s: "bin/%s"
+`, id, id, version, id, id)
 }
 
 func zipArchive(t *testing.T, files map[string]string) []byte {

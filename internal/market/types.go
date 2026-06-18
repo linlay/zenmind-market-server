@@ -64,6 +64,7 @@ type PublishRequest struct {
 	Uninstall         *MarketScriptSpec   `json:"uninstall"`
 	Detect            *MarketDetectSpec   `json:"detect"`
 	Platform          *MarketPlatformSpec `json:"platform"`
+	ADPYAML           string              `json:"adpYaml"`
 }
 
 type PublicAsset struct {
@@ -151,6 +152,7 @@ type PublicItem struct {
 	Install           *MarketScriptSpec         `json:"install,omitempty"`
 	Uninstall         *MarketScriptSpec         `json:"uninstall,omitempty"`
 	Detect            *MarketDetectSpec         `json:"detect,omitempty"`
+	ADPInstallURL     string                    `json:"adpInstallUrl,omitempty"`
 	CreatedAt         time.Time                 `json:"createdAt"`
 	PublishedAt       time.Time                 `json:"publishedAt"`
 	UpdatedAt         time.Time                 `json:"updatedAt"`
@@ -214,6 +216,7 @@ type DesktopCatalogItem struct {
 	Install           *MarketScriptSpec         `json:"install,omitempty"`
 	Uninstall         *MarketScriptSpec         `json:"uninstall,omitempty"`
 	Detect            *MarketDetectSpec         `json:"detect,omitempty"`
+	ADPInstallURL     string                    `json:"adpInstallUrl,omitempty"`
 	CreatedAt         time.Time                 `json:"createdAt"`
 	PublishedAt       time.Time                 `json:"publishedAt"`
 	UpdatedAt         time.Time                 `json:"updatedAt"`
@@ -275,6 +278,7 @@ type storedItem struct {
 	Install           *MarketScriptSpec
 	Uninstall         *MarketScriptSpec
 	Detect            *MarketDetectSpec
+	ADPYAML           string
 	DownloadCount     int
 	FavoriteCount     int
 	Favorited         bool
