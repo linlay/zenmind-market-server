@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -51,6 +52,7 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/catalog", a.handleCatalog)
 	mux.HandleFunc("GET /api/v1/desktop/catalog", a.handleDesktopCatalog)
 	mux.HandleFunc("GET /api/v1/items/{type}/{id}", a.handleItem)
+	mux.HandleFunc("GET /api/v1/adp/{type}/{id}", a.handleADPManifest)
 	for _, route := range marketRouteDefinitions() {
 		route := route
 		mux.HandleFunc("GET /api/v1/"+route.Path, func(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +143,7 @@ func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
 			Install:           public.Install,
 			Uninstall:         public.Uninstall,
 			Detect:            public.Detect,
+			ADPInstallURL:     public.ADPInstallURL,
 			CreatedAt:         public.CreatedAt,
 			PublishedAt:       public.PublishedAt,
 			UpdatedAt:         public.UpdatedAt,
@@ -339,6 +342,12 @@ func (a *App) handlePublishWithType(w http.ResponseWriter, r *http.Request, forc
 			writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
 			return
 		}
+		if adpYAML, err := readOptionalFormFile(r, "adp", 1024*1024); err == nil {
+			req.ADPYAML = adpYAML
+		} else if !errors.Is(err, http.ErrMissingFile) {
+			writeError(w, http.StatusBadRequest, "invalid_adp", err.Error())
+			return
+		}
 		if err := validatePublishRequest(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
 			return
@@ -374,11 +383,55 @@ func (a *App) handlePublishWithType(w http.ResponseWriter, r *http.Request, forc
 		writeError(w, http.StatusBadRequest, "invalid_artifact", err.Error())
 		return
 	}
+	if err := normalizePublishADP(r.Context(), a.store, a.cfg.PublicBaseURL, &req, artifact); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_adp", err.Error())
+		return
+	}
 	if err := a.store.Publish(r.Context(), req, artifact); err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "item": map[string]any{"type": req.Type, "id": req.ID, "version": req.Version}})
+}
+
+func (a *App) handleADPManifest(w http.ResponseWriter, r *http.Request) {
+	itemType, err := normalizeItemType(r.PathValue("type"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
+		return
+	}
+	if itemType != TypeCLITool && itemType != TypeSkill {
+		writeError(w, http.StatusBadRequest, "invalid_type", "ADP manifests are available only for cli-tool and skill")
+		return
+	}
+	yamlText, err := a.store.GetADPYAML(r.Context(), itemType, sanitizeSlug(r.PathValue("id")), r.URL.Query().Get("version"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "adp.yaml not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-yaml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, yamlText)
+}
+
+func readOptionalFormFile(r *http.Request, field string, limit int64) (string, error) {
+	file, _, err := r.FormFile(field)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(data)) > limit {
+		return "", fmt.Errorf("%s exceeds %d bytes", field, limit)
+	}
+	return string(data), nil
 }
 
 func (a *App) handleUnpublish(w http.ResponseWriter, r *http.Request) {

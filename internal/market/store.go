@@ -56,6 +56,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			metadata_json TEXT NOT NULL DEFAULT '{}',
 			dependencies_json TEXT NOT NULL DEFAULT '[]',
 			protocol_json TEXT NOT NULL DEFAULT '{}',
+			adp_yaml TEXT NOT NULL DEFAULT '',
 			published INTEGER NOT NULL DEFAULT 1,
 			published_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
@@ -70,6 +71,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			metadata_json TEXT NOT NULL DEFAULT '{}',
 			dependencies_json TEXT NOT NULL DEFAULT '[]',
 			protocol_json TEXT NOT NULL DEFAULT '{}',
+			adp_yaml TEXT NOT NULL DEFAULT '',
 			published INTEGER NOT NULL DEFAULT 1,
 			published_at TEXT NOT NULL,
 			PRIMARY KEY (item_type, item_id, version)
@@ -150,6 +152,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "items", "protocol_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "items", "adp_yaml", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "versions", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
 		return err
 	}
@@ -157,6 +162,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "versions", "protocol_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "versions", "adp_yaml", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "artifacts", "asset_role", "TEXT NOT NULL DEFAULT 'primary'"); err != nil {
@@ -369,8 +377,8 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 	}()
 
 	if _, err = tx.ExecContext(ctx, `INSERT INTO items (
-		type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, metadata_json, dependencies_json, protocol_json, published, published_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+		type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, metadata_json, dependencies_json, protocol_json, adp_yaml, published, published_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
 	ON CONFLICT(type, id) DO UPDATE SET
 		name = excluded.name,
 		description = excluded.description,
@@ -382,22 +390,24 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 		metadata_json = excluded.metadata_json,
 		dependencies_json = excluded.dependencies_json,
 		protocol_json = excluded.protocol_json,
+		adp_yaml = excluded.adp_yaml,
 		published = 1,
 		updated_at = excluded.updated_at`,
-		req.Type, req.ID, req.Name, req.Description, req.Readme, req.Version, req.MinDesktopVersion, req.SandboxKind, req.WebsiteKind, metadataJSON, dependenciesJSON, protocolJSON, now, now); err != nil {
+		req.Type, req.ID, req.Name, req.Description, req.Readme, req.Version, req.MinDesktopVersion, req.SandboxKind, req.WebsiteKind, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), now, now); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO versions (
-		item_type, item_id, version, description, readme, metadata_json, dependencies_json, protocol_json, published, published_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+		item_type, item_id, version, description, readme, metadata_json, dependencies_json, protocol_json, adp_yaml, published, published_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
 	ON CONFLICT(item_type, item_id, version) DO UPDATE SET
 		description = excluded.description,
 		readme = excluded.readme,
 		metadata_json = excluded.metadata_json,
 		dependencies_json = excluded.dependencies_json,
 		protocol_json = excluded.protocol_json,
+		adp_yaml = excluded.adp_yaml,
 		published = 1`,
-		req.Type, req.ID, req.Version, req.Description, req.Readme, metadataJSON, dependenciesJSON, protocolJSON, now); err != nil {
+		req.Type, req.ID, req.Version, req.Description, req.Readme, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), now); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO version_platforms (
@@ -464,7 +474,7 @@ func (s *Store) Unpublish(ctx context.Context, itemType ItemType, id, version st
 }
 
 func (s *Store) ListPublic(ctx context.Context, onlyType ItemType, viewerUserID string) ([]storedItem, error) {
-	query := `SELECT type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, metadata_json, dependencies_json, protocol_json, published, published_at, updated_at
+	query := `SELECT type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, metadata_json, dependencies_json, protocol_json, adp_yaml, published, published_at, updated_at
 		FROM items WHERE published = 1`
 	args := []any{}
 	if onlyType != "" {
@@ -483,7 +493,7 @@ func (s *Store) ListPublic(ctx context.Context, onlyType ItemType, viewerUserID 
 		var published int
 		var publishedAt, updatedAt string
 		var metadataJSON, dependenciesJSON, protocolJSON string
-		if err := rows.Scan(&item.Type, &item.ID, &item.Name, &item.Description, &item.Readme, &item.LatestVersion, &item.MinDesktopVersion, &item.SandboxKind, &item.WebsiteKind, &metadataJSON, &dependenciesJSON, &protocolJSON, &published, &publishedAt, &updatedAt); err != nil {
+		if err := rows.Scan(&item.Type, &item.ID, &item.Name, &item.Description, &item.Readme, &item.LatestVersion, &item.MinDesktopVersion, &item.SandboxKind, &item.WebsiteKind, &metadataJSON, &dependenciesJSON, &protocolJSON, &item.ADPYAML, &published, &publishedAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		item.Published = published == 1
@@ -526,6 +536,30 @@ func (s *Store) GetPublic(ctx context.Context, itemType ItemType, id, viewerUser
 		}
 	}
 	return storedItem{}, sql.ErrNoRows
+}
+
+func (s *Store) GetADPYAML(ctx context.Context, itemType ItemType, id, version string) (string, error) {
+	version = canonicalVersion(version)
+	if version == "" {
+		row := s.db.QueryRowContext(ctx, `SELECT adp_yaml FROM items WHERE type = ? AND id = ? AND published = 1`, itemType, id)
+		var value string
+		if err := row.Scan(&value); err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(value) == "" {
+			return "", sql.ErrNoRows
+		}
+		return value, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT adp_yaml FROM versions WHERE item_type = ? AND item_id = ? AND version = ? AND published = 1`, itemType, id, version)
+	var value string
+	if err := row.Scan(&value); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", sql.ErrNoRows
+	}
+	return value, nil
 }
 
 func (s *Store) GetArtifact(ctx context.Context, itemType ItemType, id, version, platform string) (storedArtifact, error) {
@@ -1170,6 +1204,7 @@ func publicItem(item storedItem) PublicItem {
 		Install:           item.Install,
 		Uninstall:         item.Uninstall,
 		Detect:            item.Detect,
+		ADPInstallURL:     adpInstallURL(item.Type, item.ID, item.ADPYAML),
 		CreatedAt:         item.PublishedAt,
 		PublishedAt:       item.PublishedAt,
 		UpdatedAt:         item.UpdatedAt,
@@ -1177,6 +1212,18 @@ func publicItem(item storedItem) PublicItem {
 		FavoriteCount:     item.FavoriteCount,
 		Favorited:         item.Favorited,
 	}
+}
+
+func adpInstallURL(itemType ItemType, id string, adpYAML string) string {
+	if strings.TrimSpace(adpYAML) == "" {
+		return ""
+	}
+	switch itemType {
+	case TypeCLITool, TypeSkill:
+	default:
+		return ""
+	}
+	return "/api/v1/adp/" + string(itemType) + "/" + id
 }
 
 func publicItems(items []storedItem) []PublicItem {
