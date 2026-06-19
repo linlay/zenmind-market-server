@@ -21,13 +21,17 @@ func main() {
 	}
 
 	cfg := market.Config{
-		Addr:           envString("MARKET_ADDR", ":8088"),
-		DatabasePath:   envString("MARKET_DB_PATH", "data/market.db"),
-		ArtifactRoot:   envString("MARKET_ARTIFACT_ROOT", "data/artifacts"),
-		PublicBaseURL:  envString("MARKET_PUBLIC_BASE_URL", "http://localhost:8088"),
-		AdminToken:     strings.TrimSpace(os.Getenv("MARKET_ADMIN_TOKEN")),
-		ProxyToken:     strings.TrimSpace(os.Getenv("MARKET_PROXY_TOKEN")),
-		MaxUploadBytes: envInt64("MARKET_MAX_UPLOAD_BYTES", 512*1024*1024),
+		Addr:                envString("MARKET_ADDR", ":8088"),
+		DatabasePath:        envString("MARKET_DB_PATH", "data/market.db"),
+		ArtifactRoot:        envString("MARKET_ARTIFACT_ROOT", "data/artifacts"),
+		PublicBaseURL:       envString("MARKET_PUBLIC_BASE_URL", "http://localhost:8088"),
+		AdminToken:          strings.TrimSpace(os.Getenv("MARKET_ADMIN_TOKEN")),
+		ProxyToken:          strings.TrimSpace(os.Getenv("MARKET_PROXY_TOKEN")),
+		SSOJWTIssuer:        strings.TrimSpace(os.Getenv("SSO_JWT_ISSUER")),
+		SSOJWTPublicKeyFile: strings.TrimSpace(os.Getenv("SSO_JWT_PUBLIC_KEY_FILE")),
+		SSOJWTPublicKeyPEM:  strings.TrimSpace(os.Getenv("SSO_JWT_PUBLIC_KEY_PEM")),
+		SSOJWTAudience:      envString("SSO_JWT_AUDIENCE", "zenmind-market-server"),
+		MaxUploadBytes:      envInt64("MARKET_MAX_UPLOAD_BYTES", 512*1024*1024),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

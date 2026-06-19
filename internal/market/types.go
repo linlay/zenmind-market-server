@@ -3,13 +3,17 @@ package market
 import "time"
 
 type Config struct {
-	Addr           string
-	DatabasePath   string
-	ArtifactRoot   string
-	PublicBaseURL  string
-	AdminToken     string
-	ProxyToken     string
-	MaxUploadBytes int64
+	Addr                string
+	DatabasePath        string
+	ArtifactRoot        string
+	PublicBaseURL       string
+	AdminToken          string
+	ProxyToken          string
+	SSOJWTIssuer        string
+	SSOJWTPublicKeyFile string
+	SSOJWTPublicKeyPEM  string
+	SSOJWTAudience      string
+	MaxUploadBytes      int64
 }
 
 type ItemType string

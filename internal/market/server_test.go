@@ -6,7 +6,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -22,15 +29,33 @@ import (
 
 func newTestApp(t *testing.T) *App {
 	t.Helper()
+	return newTestAppWithConfig(t, Config{})
+}
+
+func newTestAppWithConfig(t *testing.T, override Config) *App {
+	t.Helper()
 	root := t.TempDir()
-	app, err := Open(context.Background(), Config{
+	cfg := Config{
 		DatabasePath:   filepath.Join(root, "market.db"),
 		ArtifactRoot:   filepath.Join(root, "artifacts"),
 		PublicBaseURL:  "http://market.test",
 		AdminToken:     "secret",
 		ProxyToken:     "proxy-secret",
 		MaxUploadBytes: 10 * 1024 * 1024,
-	})
+	}
+	if override.SSOJWTIssuer != "" {
+		cfg.SSOJWTIssuer = override.SSOJWTIssuer
+	}
+	if override.SSOJWTPublicKeyFile != "" {
+		cfg.SSOJWTPublicKeyFile = override.SSOJWTPublicKeyFile
+	}
+	if override.SSOJWTPublicKeyPEM != "" {
+		cfg.SSOJWTPublicKeyPEM = override.SSOJWTPublicKeyPEM
+	}
+	if override.SSOJWTAudience != "" {
+		cfg.SSOJWTAudience = override.SSOJWTAudience
+	}
+	app, err := Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -547,6 +572,96 @@ func TestFavoriteItemsUseTrustedProxyUser(t *testing.T) {
 		t.Fatalf("unpublish status = %d body=%s", rec.Code, rec.Body.String())
 	}
 	_ = favoriteRequest(t, handler, http.MethodPost, "/api/v1/skills/favorite-demo/favorite", "alice", http.StatusNotFound)
+}
+
+func TestFavoriteItemsUseSSOJWTUser(t *testing.T) {
+	privateKey, publicKeyPEM := testSSOJWTKey(t)
+	app := newTestAppWithConfig(t, Config{
+		SSOJWTIssuer:       "https://official.example.test",
+		SSOJWTPublicKeyPEM: publicKeyPEM,
+		SSOJWTAudience:     "zenmind-market-server",
+	})
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type:        TypeSkill,
+		ID:          "jwt-favorite-demo",
+		Name:        "JWT Favorite Demo",
+		Version:     "1.0.0",
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"jwt-favorite-demo/SKILL.md": "# Favorite\n"}))
+
+	token := signTestSSOJWT(t, privateKey, testSSOJWTClaims{
+		Issuer:   "https://official.example.test",
+		Audience: "zenmind-market-server",
+		UserID:   "42",
+		Email:    "jwt.user@example.test",
+		Role:     "user",
+		Expires:  time.Now().Add(time.Hour),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/jwt-favorite-demo/favorite", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("favorite with JWT status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/items/skill/jwt-favorite-demo", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detail with JWT status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var detail PublicItem
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if !detail.Favorited || detail.FavoriteCount != 1 {
+		t.Fatalf("JWT viewer favorite state = %+v", detail)
+	}
+}
+
+func TestSSOJWTAdminAuthAndAudienceValidation(t *testing.T) {
+	privateKey, publicKeyPEM := testSSOJWTKey(t)
+	app := newTestAppWithConfig(t, Config{
+		SSOJWTIssuer:       "https://official.example.test",
+		SSOJWTPublicKeyPEM: publicKeyPEM,
+		SSOJWTAudience:     "zenmind-market-server",
+	})
+	handler := app.Routes()
+
+	adminToken := signTestSSOJWT(t, privateKey, testSSOJWTClaims{
+		Issuer:   "https://official.example.test",
+		Audience: "zenmind-market-server",
+		UserID:   "1",
+		Email:    "admin@example.test",
+		Role:     "admin",
+		Expires:  time.Now().Add(time.Hour),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"missing"}`))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin JWT status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	wrongAudienceToken := signTestSSOJWT(t, privateKey, testSSOJWTClaims{
+		Issuer:   "https://official.example.test",
+		Audience: "zenmind-tunnel-hub-server",
+		UserID:   "1",
+		Email:    "admin@example.test",
+		Role:     "admin",
+		Expires:  time.Now().Add(time.Hour),
+	})
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"missing"}`))
+	req.Header.Set("Authorization", "Bearer "+wrongAudienceToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong audience status = %d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestCatalogHandlesConcurrentRequests(t *testing.T) {
@@ -1367,6 +1482,57 @@ func favoriteRequest(t *testing.T, handler http.Handler, method, path, userID st
 func setProxyUser(req *http.Request, userID string) {
 	req.Header.Set("X-ZenMind-Market-Proxy-Token", "proxy-secret")
 	req.Header.Set("X-ZenMind-User-ID", userID)
+}
+
+type testSSOJWTClaims struct {
+	Issuer   string
+	Audience string
+	UserID   string
+	Email    string
+	Role     string
+	Expires  time.Time
+}
+
+func testSSOJWTKey(t *testing.T) (*rsa.PrivateKey, string) {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+	publicKeyDER, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		t.Fatalf("marshal public key: %v", err)
+	}
+	publicKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: publicKeyDER,
+	})
+	return privateKey, string(publicKeyPEM)
+}
+
+func signTestSSOJWT(t *testing.T, privateKey *rsa.PrivateKey, claims testSSOJWTClaims) string {
+	t.Helper()
+	headerJSON, _ := json.Marshal(map[string]any{"alg": "RS256", "typ": "JWT", "kid": "test-key"})
+	claimsJSON, _ := json.Marshal(map[string]any{
+		"iss":     claims.Issuer,
+		"sub":     "user:" + claims.UserID,
+		"aud":     claims.Audience,
+		"iat":     time.Now().Unix(),
+		"exp":     claims.Expires.Unix(),
+		"jti":     "test-jti",
+		"user_id": claims.UserID,
+		"email":   claims.Email,
+		"role":    claims.Role,
+	})
+	headerPart := base64.RawURLEncoding.EncodeToString(headerJSON)
+	payloadPart := base64.RawURLEncoding.EncodeToString(claimsJSON)
+	signedValue := headerPart + "." + payloadPart
+	digest := sha256.Sum256([]byte(signedValue))
+	signature, err := rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, digest[:])
+	if err != nil {
+		t.Fatalf("sign JWT: %v", err)
+	}
+	return signedValue + "." + base64.RawURLEncoding.EncodeToString(signature)
 }
 
 func publishMultipart(t *testing.T, handler http.Handler, metadata PublishRequest, archive []byte) {

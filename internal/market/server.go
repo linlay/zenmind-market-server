@@ -16,8 +16,9 @@ import (
 )
 
 type App struct {
-	cfg   Config
-	store *Store
+	cfg    Config
+	store  *Store
+	ssoJWT *ssoJWTVerifier
 }
 
 func Open(ctx context.Context, cfg Config) (*App, error) {
@@ -31,7 +32,12 @@ func Open(ctx context.Context, cfg Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &App{cfg: cfg, store: store}, nil
+	ssoJWT, err := newSSOJWTVerifier(cfg)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	return &App{cfg: cfg, store: store, ssoJWT: ssoJWT}, nil
 }
 
 func (a *App) Close() error {
@@ -468,6 +474,9 @@ func (a *App) authorizedAdmin(r *http.Request) bool {
 	if a.cfg.AdminToken != "" && strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(auth, "Bearer")), a.cfg.AdminToken) {
 		return true
 	}
+	if principal, ok := a.ssoJWT.principalFromRequest(r); ok && principal.Role == "admin" {
+		return true
+	}
 	if a.cfg.ProxyToken == "" || r.Header.Get("X-ZenMind-Market-Proxy-Token") != a.cfg.ProxyToken {
 		return false
 	}
@@ -476,10 +485,13 @@ func (a *App) authorizedAdmin(r *http.Request) bool {
 }
 
 func (a *App) viewerUserID(r *http.Request) string {
-	if a.cfg.ProxyToken == "" || r.Header.Get("X-ZenMind-Market-Proxy-Token") != a.cfg.ProxyToken {
-		return ""
+	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
+		return strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
 	}
-	return strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
+	if principal, ok := a.ssoJWT.principalFromRequest(r); ok {
+		return principal.UserID
+	}
+	return ""
 }
 
 func intQuery(r *http.Request, key string, fallback int) int {
