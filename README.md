@@ -18,7 +18,9 @@ Default paths:
 - artifacts: `data/artifacts`
 - listen address: `:8088`
 
-Admin APIs accept `Authorization: Bearer $MARKET_ADMIN_TOKEN`, trusted official proxy headers with `X-ZenMind-Market-Proxy-Token: $MARKET_PROXY_TOKEN`, or a valid SSO JWT with `role=admin`.
+Public catalog and component list APIs are readable without a token, including `/api/v1/catalog`, `/api/v1/desktop/catalog`, and typed market list/detail/resolve/download routes. Desktop user actions such as favorite/unfavorite accept an official-site SSO JWT with `aud=zenmind-market-server` and `scope` containing `market`.
+
+The market website auth flow is unchanged: it can continue to sit behind the official-site session flow or authentik gateway. Admin APIs keep accepting `Authorization: Bearer $MARKET_ADMIN_TOKEN` and trusted official proxy headers with `X-ZenMind-Market-Proxy-Token: $MARKET_PROXY_TOKEN`; they also accept official-site SSO JWTs with `role=admin` and `scope` containing `market`.
 
 ## Storage and deployment
 
@@ -50,9 +52,18 @@ The server loads `.env` from the current working directory before building its r
 | `MARKET_ADMIN_TOKEN` | empty | Bearer token required for admin APIs. |
 | `MARKET_PROXY_TOKEN` | empty | Trusted proxy header token. |
 | `SSO_JWT_ISSUER` | empty | Expected issuer for official-site SSO JWTs. Leave empty to disable JWT auth. |
-| `SSO_JWT_PUBLIC_KEY_FILE` | empty | PEM public key file used to verify SSO JWTs. |
+| `SSO_JWT_PUBLIC_KEY_FILE` | `configs/jwt-public.pem` | PEM public key file used to verify Desktop SSO JWTs. |
 | `SSO_JWT_PUBLIC_KEY_PEM` | empty | PEM public key value fallback; supports escaped `\n`. |
 | `SSO_JWT_AUDIENCE` | `zenmind-market-server` | Required JWT audience. |
 | `MARKET_MAX_UPLOAD_BYTES` | `536870912` | Maximum upload size in bytes. |
+
+Do not commit key material. Keep the official-site JWT public key in the ignored project-local file `configs/jwt-public.pem`, then mount `./configs` read-only in production.
+
+Export the public key from the official-site JWT private key:
+
+```bash
+mkdir -p configs
+openssl pkey -in /path/to/official-sso-private.pem -pubout -out configs/jwt-public.pem
+```
 # zenmind-market-server
 # zenmind-market-server

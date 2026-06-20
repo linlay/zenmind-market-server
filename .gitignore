@@ -2,6 +2,8 @@
 data/
 /market-server
 coverage.out
+configs/*.pem
+configs/*.key
 
 .env
 .env.*

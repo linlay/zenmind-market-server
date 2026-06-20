@@ -15,10 +15,16 @@ import (
 	"time"
 )
 
+var (
+	errSSOJWTNotConfigured = errors.New("SSO JWT verifier is not configured")
+	errBearerTokenMissing  = errors.New("bearer token is missing")
+)
+
 type ssoJWTPrincipal struct {
 	UserID string
 	Email  string
 	Role   string
+	Scope  string
 }
 
 type ssoJWTVerifier struct {
@@ -30,18 +36,37 @@ type ssoJWTVerifier struct {
 func newSSOJWTVerifier(cfg Config) (*ssoJWTVerifier, error) {
 	issuer := strings.TrimSpace(cfg.SSOJWTIssuer)
 	audience := strings.TrimSpace(cfg.SSOJWTAudience)
+	if issuer == "" {
+		return nil, nil
+	}
+	if audience == "" {
+		return nil, errors.New("SSO_JWT_AUDIENCE is required")
+	}
 	publicKey, configured, err := loadSSOJWTPublicKey(cfg.SSOJWTPublicKeyFile, cfg.SSOJWTPublicKeyPEM)
 	if err != nil {
 		return nil, err
 	}
-	if issuer == "" || audience == "" || !configured {
-		return nil, nil
+	if !configured {
+		return nil, errors.New("SSO_JWT_PUBLIC_KEY_FILE or SSO_JWT_PUBLIC_KEY_PEM is required")
 	}
 	return &ssoJWTVerifier{
 		issuer:    issuer,
 		audience:  audience,
 		publicKey: publicKey,
 	}, nil
+}
+
+func (p ssoJWTPrincipal) HasScope(scope string) bool {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return false
+	}
+	for _, item := range strings.Fields(p.Scope) {
+		if item == scope {
+			return true
+		}
+	}
+	return false
 }
 
 func loadSSOJWTPublicKey(filePath, pemValue string) (*rsa.PublicKey, bool, error) {
@@ -81,15 +106,19 @@ func parseSSOJWTPublicKeyPEM(value string) (*rsa.PublicKey, error) {
 }
 
 func (v *ssoJWTVerifier) principalFromRequest(r *http.Request) (ssoJWTPrincipal, bool) {
-	if v == nil {
-		return ssoJWTPrincipal{}, false
-	}
-	token := bearerToken(r.Header.Get("Authorization"))
-	if token == "" {
-		return ssoJWTPrincipal{}, false
-	}
-	principal, err := v.verify(token, time.Now())
+	principal, err := v.verifyBearerHeader(r.Header.Get("Authorization"))
 	return principal, err == nil
+}
+
+func (v *ssoJWTVerifier) verifyBearerHeader(header string) (ssoJWTPrincipal, error) {
+	if v == nil {
+		return ssoJWTPrincipal{}, errSSOJWTNotConfigured
+	}
+	token := bearerToken(header)
+	if token == "" {
+		return ssoJWTPrincipal{}, errBearerTokenMissing
+	}
+	return v.verify(token, time.Now())
 }
 
 func bearerToken(header string) string {
@@ -151,6 +180,7 @@ func (v *ssoJWTVerifier) verify(token string, now time.Time) (ssoJWTPrincipal, e
 		UserID: userID,
 		Email:  readStringClaim(claims, "email"),
 		Role:   strings.ToLower(readStringClaim(claims, "role")),
+		Scope:  readStringClaim(claims, "scope"),
 	}, nil
 }
 

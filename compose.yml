@@ -12,12 +12,13 @@ services:
       MARKET_ADMIN_TOKEN: ${MARKET_ADMIN_TOKEN:-}
       MARKET_PROXY_TOKEN: ${MARKET_PROXY_TOKEN:-}
       SSO_JWT_ISSUER: ${SSO_JWT_ISSUER:-}
-      SSO_JWT_PUBLIC_KEY_FILE: ${SSO_JWT_PUBLIC_KEY_FILE:-}
+      SSO_JWT_PUBLIC_KEY_FILE: ${SSO_JWT_PUBLIC_KEY_FILE:-/configs/jwt-public.pem}
       SSO_JWT_PUBLIC_KEY_PEM: ${SSO_JWT_PUBLIC_KEY_PEM:-}
       SSO_JWT_AUDIENCE: ${SSO_JWT_AUDIENCE:-zenmind-market-server}
       MARKET_MAX_UPLOAD_BYTES: ${MARKET_MAX_UPLOAD_BYTES:-536870912}
     volumes:
       - ./data:/data
+      - ./configs:/configs:ro
     networks:
       zenmind-official-net:
         aliases:

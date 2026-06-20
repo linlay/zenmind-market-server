@@ -283,9 +283,8 @@ func (a *App) handleMarketDownload(w http.ResponseWriter, r *http.Request, itemT
 
 func (a *App) handleMarketFavorite(w http.ResponseWriter, r *http.Request, itemType ItemType, favorite bool) {
 	id := sanitizeSlug(r.PathValue("id"))
-	userID := a.viewerUserID(r)
-	if userID == "" {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "trusted proxy user required")
+	userID, ok := a.authorizedMarketUser(w, r)
+	if !ok {
 		return
 	}
 	var err error
@@ -461,37 +460,110 @@ func (a *App) downloadArtifact(w http.ResponseWriter, r *http.Request, itemType 
 
 func (a *App) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if a.authorizedAdmin(r) {
+		result := a.authorizedAdmin(r)
+		if result.OK {
 			next(w, r)
 			return
 		}
-		writeError(w, http.StatusUnauthorized, "unauthorized", "admin token required")
+		writeError(w, result.Status, result.Code, result.Message)
 	}
 }
 
-func (a *App) authorizedAdmin(r *http.Request) bool {
+type authResult struct {
+	OK      bool
+	Status  int
+	Code    string
+	Message string
+}
+
+func allowAuth() authResult {
+	return authResult{OK: true}
+}
+
+func denyAuth(status int, code, message string) authResult {
+	return authResult{Status: status, Code: code, Message: message}
+}
+
+func (a *App) authorizedAdmin(r *http.Request) authResult {
 	auth := strings.TrimSpace(r.Header.Get("authorization"))
 	if a.cfg.AdminToken != "" && strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(auth, "Bearer")), a.cfg.AdminToken) {
-		return true
+		return allowAuth()
 	}
-	if principal, ok := a.ssoJWT.principalFromRequest(r); ok && principal.Role == "admin" {
-		return true
+	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
+		role := strings.ToLower(strings.TrimSpace(r.Header.Get("X-ZenMind-User-Role")))
+		if role == "admin" {
+			return allowAuth()
+		}
 	}
-	if a.cfg.ProxyToken == "" || r.Header.Get("X-ZenMind-Market-Proxy-Token") != a.cfg.ProxyToken {
-		return false
+	if auth == "" {
+		return denyAuth(http.StatusUnauthorized, "unauthorized", "admin token required")
 	}
-	role := strings.ToLower(strings.TrimSpace(r.Header.Get("X-ZenMind-User-Role")))
-	return role == "admin"
+	if !bearerHeaderLooksLikeJWT(auth) {
+		return denyAuth(http.StatusUnauthorized, "unauthorized", "invalid bearer token")
+	}
+	principal, err := a.ssoJWT.verifyBearerHeader(auth)
+	if err != nil {
+		return jwtAuthError(err)
+	}
+	if principal.Role != "admin" {
+		return denyAuth(http.StatusForbidden, "forbidden", "admin role required")
+	}
+	if !principal.HasScope("market") {
+		return denyAuth(http.StatusForbidden, "forbidden", "market scope required")
+	}
+	return allowAuth()
 }
 
 func (a *App) viewerUserID(r *http.Request) string {
 	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
 		return strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
 	}
-	if principal, ok := a.ssoJWT.principalFromRequest(r); ok {
+	if principal, ok := a.ssoJWT.principalFromRequest(r); ok && principal.HasScope("market") {
 		return principal.UserID
 	}
 	return ""
+}
+
+func (a *App) authorizedMarketUser(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
+		userID := strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
+		if userID != "" {
+			return userID, true
+		}
+		writeError(w, http.StatusUnauthorized, "unauthorized", "trusted proxy user required")
+		return "", false
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if auth == "" {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "official JWT required")
+		return "", false
+	}
+	principal, err := a.ssoJWT.verifyBearerHeader(auth)
+	if err != nil {
+		result := jwtAuthError(err)
+		writeError(w, result.Status, result.Code, result.Message)
+		return "", false
+	}
+	if !principal.HasScope("market") {
+		writeError(w, http.StatusForbidden, "forbidden", "market scope required")
+		return "", false
+	}
+	return principal.UserID, true
+}
+
+func jwtAuthError(err error) authResult {
+	if errors.Is(err, errSSOJWTNotConfigured) {
+		return denyAuth(http.StatusServiceUnavailable, "sso_jwt_not_configured", "official JWT verifier is not configured")
+	}
+	if errors.Is(err, errBearerTokenMissing) {
+		return denyAuth(http.StatusUnauthorized, "unauthorized", "official JWT required")
+	}
+	return denyAuth(http.StatusUnauthorized, "unauthorized", "invalid bearer token")
+}
+
+func bearerHeaderLooksLikeJWT(header string) bool {
+	token := bearerToken(header)
+	return strings.Count(token, ".") == 2
 }
 
 func intQuery(r *http.Request, key string, fallback int) int {

@@ -15,6 +15,8 @@ import (
 	"github.com/linlay/zenmind-market-server/internal/market"
 )
 
+const defaultSSOJWTPublicKeyFile = "configs/jwt-public.pem"
+
 func main() {
 	if err := loadDotEnv(".env"); err != nil {
 		log.Fatalf("load .env: %v", err)
@@ -28,7 +30,7 @@ func main() {
 		AdminToken:          strings.TrimSpace(os.Getenv("MARKET_ADMIN_TOKEN")),
 		ProxyToken:          strings.TrimSpace(os.Getenv("MARKET_PROXY_TOKEN")),
 		SSOJWTIssuer:        strings.TrimSpace(os.Getenv("SSO_JWT_ISSUER")),
-		SSOJWTPublicKeyFile: strings.TrimSpace(os.Getenv("SSO_JWT_PUBLIC_KEY_FILE")),
+		SSOJWTPublicKeyFile: envString("SSO_JWT_PUBLIC_KEY_FILE", defaultSSOJWTPublicKeyFile),
 		SSOJWTPublicKeyPEM:  strings.TrimSpace(os.Getenv("SSO_JWT_PUBLIC_KEY_PEM")),
 		SSOJWTAudience:      envString("SSO_JWT_AUDIENCE", "zenmind-market-server"),
 		MaxUploadBytes:      envInt64("MARKET_MAX_UPLOAD_BYTES", 512*1024*1024),

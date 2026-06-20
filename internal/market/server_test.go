@@ -200,6 +200,39 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	}
 }
 
+func TestPublicReadEndpointsRemainAnonymous(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type:        TypeSkill,
+		ID:          "anonymous-demo",
+		Name:        "Anonymous Demo",
+		Version:     "1.0.0",
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"anonymous-demo/SKILL.md": "# Anonymous\n"}))
+
+	cases := []struct {
+		path       string
+		wantStatus int
+	}{
+		{path: "/api/v1/catalog", wantStatus: http.StatusOK},
+		{path: "/api/v1/desktop/catalog", wantStatus: http.StatusOK},
+		{path: "/api/v1/skills", wantStatus: http.StatusOK},
+		{path: "/api/v1/skills/anonymous-demo", wantStatus: http.StatusOK},
+		{path: "/api/v1/skills/anonymous-demo/versions", wantStatus: http.StatusOK},
+		{path: "/api/v1/skills/anonymous-demo/resolve", wantStatus: http.StatusOK},
+		{path: "/api/v1/skills/anonymous-demo/download", wantStatus: http.StatusFound},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != tc.wantStatus {
+			t.Fatalf("GET %s status = %d, want %d body=%s", tc.path, rec.Code, tc.wantStatus, rec.Body.String())
+		}
+	}
+}
+
 func TestVersionCanonicalizationAtAPIBoundaries(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
@@ -596,6 +629,7 @@ func TestFavoriteItemsUseSSOJWTUser(t *testing.T) {
 		UserID:   "42",
 		Email:    "jwt.user@example.test",
 		Role:     "user",
+		Scope:    "profile market tunnel",
 		Expires:  time.Now().Add(time.Hour),
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/jwt-favorite-demo/favorite", nil)
@@ -620,6 +654,23 @@ func TestFavoriteItemsUseSSOJWTUser(t *testing.T) {
 	if !detail.Favorited || detail.FavoriteCount != 1 {
 		t.Fatalf("JWT viewer favorite state = %+v", detail)
 	}
+
+	noMarketScopeToken := signTestSSOJWT(t, privateKey, testSSOJWTClaims{
+		Issuer:   "https://official.example.test",
+		Audience: "zenmind-market-server",
+		UserID:   "43",
+		Email:    "jwt.no-market@example.test",
+		Role:     "user",
+		Scope:    "profile tunnel",
+		Expires:  time.Now().Add(time.Hour),
+	})
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/skills/jwt-favorite-demo/favorite", nil)
+	req.Header.Set("Authorization", "Bearer "+noMarketScopeToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("favorite without market scope status = %d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestSSOJWTAdminAuthAndAudienceValidation(t *testing.T) {
@@ -637,6 +688,7 @@ func TestSSOJWTAdminAuthAndAudienceValidation(t *testing.T) {
 		UserID:   "1",
 		Email:    "admin@example.test",
 		Role:     "admin",
+		Scope:    "profile market tunnel",
 		Expires:  time.Now().Add(time.Hour),
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"missing"}`))
@@ -653,6 +705,7 @@ func TestSSOJWTAdminAuthAndAudienceValidation(t *testing.T) {
 		UserID:   "1",
 		Email:    "admin@example.test",
 		Role:     "admin",
+		Scope:    "profile market tunnel",
 		Expires:  time.Now().Add(time.Hour),
 	})
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"missing"}`))
@@ -661,6 +714,23 @@ func TestSSOJWTAdminAuthAndAudienceValidation(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong audience status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	noMarketScopeToken := signTestSSOJWT(t, privateKey, testSSOJWTClaims{
+		Issuer:   "https://official.example.test",
+		Audience: "zenmind-market-server",
+		UserID:   "1",
+		Email:    "admin@example.test",
+		Role:     "admin",
+		Scope:    "profile tunnel",
+		Expires:  time.Now().Add(time.Hour),
+	})
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"missing"}`))
+	req.Header.Set("Authorization", "Bearer "+noMarketScopeToken)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("admin without market scope status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1490,6 +1560,7 @@ type testSSOJWTClaims struct {
 	UserID   string
 	Email    string
 	Role     string
+	Scope    string
 	Expires  time.Time
 }
 
@@ -1523,6 +1594,7 @@ func signTestSSOJWT(t *testing.T, privateKey *rsa.PrivateKey, claims testSSOJWTC
 		"user_id": claims.UserID,
 		"email":   claims.Email,
 		"role":    claims.Role,
+		"scope":   claims.Scope,
 	})
 	headerPart := base64.RawURLEncoding.EncodeToString(headerJSON)
 	payloadPart := base64.RawURLEncoding.EncodeToString(claimsJSON)
