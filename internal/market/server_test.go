@@ -1622,9 +1622,43 @@ packages:
       - "/tmp/bad-skill-path"
     hooks:
       post:
-        - "echo install"
+        - sh: "echo install"
+          os: [linux, macos]
 `,
 	}, zipArchive(t, map[string]string{"bad/SKILL.md": "# Bad\n"}), http.StatusBadRequest)
+}
+
+func TestADPRejectsLegacyHookSyntax(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	legacyCommand := "comm" + "and"
+	scalarHook := "- " + `"echo install"`
+
+	for name, hookLine := range map[string]string{
+		"bad-hook-command": "        - " + legacyCommand + `: "echo install"`,
+		"bad-hook-scalar":  "        " + scalarHook,
+	} {
+		publishMultipartAt(t, handler, "/api/v1/admin/skills/publish", PublishRequest{
+			ID:          name,
+			Name:        "Bad Hook",
+			Version:     "1.0.0",
+			ArchiveType: "zip",
+			ADPYAML: strings.Join([]string{
+				`schema: "0.1"`,
+				"name: " + name + "-adp",
+				"packages:",
+				"  - id: " + name,
+				`    version: "1.0.0"`,
+				"    x-zenmind-artifact: primary",
+				"    x-adp-managed-paths:",
+				`      - "${ADP_HOME}/zenmind/skills/` + name + `/1.0.0"`,
+				"    hooks:",
+				"      post:",
+				hookLine,
+				"",
+			}, "\n"),
+		}, zipArchive(t, map[string]string{"bad/SKILL.md": "# Bad\n"}), http.StatusBadRequest)
+	}
 }
 
 func TestNormalizeItemTypeAliases(t *testing.T) {
@@ -1834,8 +1868,11 @@ packages:
       - "${ADP_HOME}/zenmind/skills/%s/%s"
     hooks:
       post:
-        - "mkdir -p ${ADP_HOME}/zenmind/skills/%s/%s && cp -R ${ADP_PKG_DIR}/. ${ADP_HOME}/zenmind/skills/%s/%s"
-`, id, id, version, id, version, id, version, id, version)
+        - sh: "mkdir -p ${ADP_HOME}/zenmind/skills/%s/%s && cp -R ${ADP_PKG_DIR}/. ${ADP_HOME}/zenmind/skills/%s/%s"
+          os: [linux, macos]
+        - pwsh: "New-Item -ItemType Directory -Force -Path ${ADP_HOME}/zenmind/skills/%s/%s; Copy-Item -Recurse -Force ${ADP_PKG_DIR}/* ${ADP_HOME}/zenmind/skills/%s/%s"
+          os: [windows]
+`, id, id, version, id, version, id, version, id, version, id, version, id, version)
 	}
 	return fmt.Sprintf(`schema: "0.1"
 name: %s-adp

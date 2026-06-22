@@ -21,6 +21,7 @@ var adpTopLevelFields = map[string]struct{}{
 	"requires_privilege": {},
 	"defaults":           {},
 	"env":                {},
+	"hooks":              {},
 	"packages":           {},
 }
 
@@ -57,6 +58,17 @@ var adpPlatformKeys = map[string]struct{}{
 	"macos-arm64":   {},
 	"windows-x64":   {},
 	"windows-arm64": {},
+}
+
+var adpHookOS = map[string]struct{}{
+	"linux":   {},
+	"macos":   {},
+	"windows": {},
+}
+
+var adpHookArch = map[string]struct{}{
+	"x64":   {},
+	"arm64": {},
 }
 
 type adpDocument map[string]any
@@ -164,6 +176,9 @@ func validateADPDocument(doc adpDocument) error {
 	if strings.TrimSpace(stringField(doc, "name")) == "" {
 		return errors.New("adp.yaml name is required")
 	}
+	if err := validateADPHooks(doc, "hooks"); err != nil {
+		return err
+	}
 	packages, err := adpPackages(doc)
 	if err != nil {
 		return err
@@ -227,6 +242,9 @@ func validateADPPackage(pkg any) error {
 			return errors.New("object package requires id")
 		}
 		if err := validateManagedPaths(value); err != nil {
+			return err
+		}
+		if err := validateADPHooks(value, "hooks"); err != nil {
 			return err
 		}
 		if err := validatePlatformMap(value, "from"); err != nil {
@@ -548,6 +566,140 @@ func hasPostHook(pkg map[string]any) bool {
 	}
 	post, ok := hooks["post"].([]any)
 	return ok && len(post) > 0
+}
+
+func validateADPHooks(values map[string]any, field string) error {
+	raw, ok := values[field]
+	if !ok || raw == nil {
+		return nil
+	}
+	hooks, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be a map", field)
+	}
+	for phase, rawList := range hooks {
+		switch phase {
+		case "pre", "post", "verify":
+		default:
+			return fmt.Errorf("%s has unknown phase %q", field, phase)
+		}
+		list, ok := rawList.([]any)
+		if !ok {
+			return fmt.Errorf("%s.%s must be an array", field, phase)
+		}
+		for index, rawHook := range list {
+			if err := validateADPHook(rawHook); err != nil {
+				return fmt.Errorf("%s.%s[%d]: %w", field, phase, index, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateADPHook(raw any) error {
+	hook, ok := raw.(map[string]any)
+	if !ok {
+		return errors.New("hook must be an object")
+	}
+	runners := 0
+	for key, value := range hook {
+		switch key {
+		case "exec":
+			runners++
+			args, ok := value.([]any)
+			if !ok {
+				return errors.New("exec must be an array")
+			}
+			if len(args) == 0 {
+				return errors.New("exec must not be empty")
+			}
+			for _, arg := range args {
+				if text, ok := arg.(string); !ok || strings.TrimSpace(text) == "" {
+					return errors.New("exec must contain only non-empty strings")
+				}
+			}
+		case "sh", "pwsh", "cmd":
+			runners++
+			if text, ok := value.(string); !ok || strings.TrimSpace(text) == "" {
+				return fmt.Errorf("%s must be a non-empty string", key)
+			}
+		case "allow_failure":
+			if _, ok := value.(bool); !ok {
+				return errors.New("allow_failure must be a boolean")
+			}
+		case "timeout":
+			if !positiveIntValue(value) {
+				return errors.New("timeout must be a positive integer")
+			}
+		case "env":
+			env, ok := value.(map[string]any)
+			if !ok {
+				return errors.New("env must be a map")
+			}
+			for envKey, envValue := range env {
+				if strings.TrimSpace(envKey) == "" {
+					return errors.New("env keys must not be empty")
+				}
+				if _, ok := envValue.(string); !ok {
+					return errors.New("env values must be strings")
+				}
+			}
+		case "cwd":
+			if _, ok := value.(string); !ok {
+				return errors.New("cwd must be a string")
+			}
+		case "platforms":
+			if err := validateStringEnumList(value, adpPlatformKeys, "platforms"); err != nil {
+				return err
+			}
+		case "os":
+			if err := validateStringEnumList(value, adpHookOS, "os"); err != nil {
+				return err
+			}
+		case "arch":
+			if err := validateStringEnumList(value, adpHookArch, "arch"); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown hook field %q", key)
+		}
+	}
+	if runners != 1 {
+		return errors.New("hook must declare exactly one runner: exec, sh, pwsh, or cmd")
+	}
+	return nil
+}
+
+func positiveIntValue(value any) bool {
+	switch typed := value.(type) {
+	case int:
+		return typed > 0
+	case int64:
+		return typed > 0
+	case uint64:
+		return typed > 0
+	case float64:
+		return typed > 0 && typed == float64(int64(typed))
+	default:
+		return false
+	}
+}
+
+func validateStringEnumList(raw any, allowed map[string]struct{}, field string) error {
+	list, ok := raw.([]any)
+	if !ok {
+		return fmt.Errorf("%s must be an array", field)
+	}
+	for _, item := range list {
+		value, ok := item.(string)
+		if !ok || strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s must contain only non-empty strings", field)
+		}
+		if _, ok := allowed[strings.ToLower(strings.TrimSpace(value))]; !ok {
+			return fmt.Errorf("%s has unsupported value %q", field, value)
+		}
+	}
+	return nil
 }
 
 func marketPlatformToADPKeys(platform string) []string {
