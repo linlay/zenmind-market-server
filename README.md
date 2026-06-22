@@ -24,6 +24,8 @@ Admin APIs accept either `Authorization: Bearer $MARKET_ADMIN_TOKEN` or trusted 
 
 The server is the source of truth for market data. The website should read `/api/v1/catalog`; uploaded artifacts should never be baked into the frontend image or copied into the nginx static directory.
 
+CLI tools and skills require an ADP `schema: "0.1"` manifest at publish time. The server validates the latest hook protocol (`exec`, `sh`, `pwsh`, `cmd` runners), rejects legacy hook syntax, and binds uploaded artifact URLs plus SHA-256 values into the stored `adp.yaml`.
+
 In container deployments, keep SQLite and artifacts in the same persistent backend volume:
 
 ```yaml

@@ -281,10 +281,12 @@ packages:
       - "\${ADP_HOME}/zenmind/runtime/zmctl/1.0.0"
     hooks:
       post:
-        - command: "mkdir -p \${ADP_HOME}/zenmind/runtime/zmctl/1.0.0 && printf 'runtime ready\\n' > \${ADP_HOME}/zenmind/runtime/zmctl/1.0.0/status.txt"
+        - sh: "mkdir -p \${ADP_HOME}/zenmind/runtime/zmctl/1.0.0 && printf 'runtime ready\\n' > \${ADP_HOME}/zenmind/runtime/zmctl/1.0.0/status.txt"
+          os: [linux, macos]
           timeout: 30
       verify:
-        - command: "test -f \${ADP_PKG_DIR}/.adp_sha256"
+        - sh: "test -f \${ADP_PKG_DIR}/.adp_sha256"
+          os: [linux, macos]
           timeout: 30
   - id: zmctl
     version: "1.0.0"
@@ -310,13 +312,15 @@ packages:
         mode: "0644"
     hooks:
       pre:
-        - command: "echo preparing zmctl install"
+        - exec: ["echo", "preparing zmctl install"]
           timeout: 30
       post:
-        - command: "mkdir -p \${ADP_HOME}/zenmind/cli/zmctl/1.0.0 && printf 'installed from %s\\n' \"\${ADP_PKG_DIR}\" > \${ADP_HOME}/zenmind/cli/zmctl/1.0.0/install.log"
+        - sh: "mkdir -p \${ADP_HOME}/zenmind/cli/zmctl/1.0.0 && printf 'installed from %s\\n' \"\${ADP_PKG_DIR}\" > \${ADP_HOME}/zenmind/cli/zmctl/1.0.0/install.log"
+          os: [linux, macos]
           timeout: 30
       verify:
-        - command: "test -x \${ADP_BIN}/zmctl"
+        - sh: "test -x \${ADP_BIN}/zmctl"
+          os: [linux, macos]
           timeout: 30
 YAML
 
@@ -339,7 +343,7 @@ packages:
       provider-plan-demo: bin/provider-plan-demo
     hooks:
       verify:
-        - command: "provider-plan-demo --version"
+        - exec: ["provider-plan-demo", "--version"]
           timeout: 30
 YAML
 
@@ -393,13 +397,13 @@ packages:
       system-deps-demo: bin/system-deps-demo
     hooks:
       pre:
-        - command: "git --version"
+        - exec: ["git", "--version"]
           timeout: 60
       post:
-        - command: "jq --version"
+        - exec: ["jq", "--version"]
           timeout: 60
       verify:
-        - command: "system-deps-demo --version"
+        - exec: ["system-deps-demo", "--version"]
           timeout: 30
 YAML
 
@@ -445,10 +449,18 @@ packages:
       - "${ADP_HOME}/zenmind/skills/research-skill/1.2.0"
     hooks:
       post:
-        - command: "mkdir -p ${ADP_HOME}/zenmind/skills/research-skill/1.2.0 && cp -R ${ADP_PKG_DIR}/. ${ADP_HOME}/zenmind/skills/research-skill/1.2.0"
+        - sh: "mkdir -p ${ADP_HOME}/zenmind/skills/research-skill/1.2.0 && cp -R ${ADP_PKG_DIR}/. ${ADP_HOME}/zenmind/skills/research-skill/1.2.0"
+          os: [linux, macos]
+          timeout: 60
+        - pwsh: "New-Item -ItemType Directory -Force -Path ${ADP_HOME}/zenmind/skills/research-skill/1.2.0; Copy-Item -Recurse -Force ${ADP_PKG_DIR}/* ${ADP_HOME}/zenmind/skills/research-skill/1.2.0"
+          os: [windows]
           timeout: 60
       verify:
-        - command: "test -f ${ADP_HOME}/zenmind/skills/research-skill/1.2.0/SKILL.md"
+        - sh: "test -f ${ADP_HOME}/zenmind/skills/research-skill/1.2.0/SKILL.md"
+          os: [linux, macos]
+          timeout: 30
+        - pwsh: "Test-Path ${ADP_HOME}/zenmind/skills/research-skill/1.2.0/SKILL.md"
+          os: [windows]
           timeout: 30
 YAML
 
@@ -531,7 +543,7 @@ packages:
       - "${ADP_HOME}/zenmind/skills/legacy-skill/0.5.0"
     hooks:
       post:
-        - "echo legacy skill installed"
+        - exec: ["echo", "legacy skill installed"]
 YAML
 
 write_file "${TMP_DIR}/metadata/legacy-skill.json" <<'JSON'
