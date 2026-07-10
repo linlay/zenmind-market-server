@@ -99,8 +99,8 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &markets); err != nil {
 		t.Fatalf("decode markets: %v", err)
 	}
-	if len(markets.Markets) != 7 {
-		t.Fatalf("market count = %d, want 7: %+v", len(markets.Markets), markets.Markets)
+	if len(markets.Markets) != 8 {
+		t.Fatalf("market count = %d, want 8: %+v", len(markets.Markets), markets.Markets)
 	}
 	archiveTypesByType := map[string][]string{}
 	var petMarket *MarketInfo
@@ -197,6 +197,209 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusFound || rec.Header().Get("Location") == "" {
 		t.Fatalf("download status = %d location=%q body=%s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
+	}
+}
+
+func TestGetPublicDoesNotLoadUnrelatedItems(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type:        TypeSkill,
+		ID:          "target-skill",
+		Name:        "Target Skill",
+		Version:     "1.0.0",
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"target-skill/SKILL.md": "# Target\n"}))
+	publishMultipart(t, handler, PublishRequest{
+		Type:        TypeSkill,
+		ID:          "malformed-skill",
+		Name:        "Malformed Skill",
+		Version:     "1.0.0",
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"malformed-skill/SKILL.md": "# Malformed\n"}))
+
+	if _, err := app.store.db.ExecContext(context.Background(), `UPDATE items SET metadata_json = '{' WHERE type = ? AND id = ?`, TypeSkill, "malformed-skill"); err != nil {
+		t.Fatalf("corrupt unrelated item metadata: %v", err)
+	}
+
+	item, err := app.store.GetPublic(context.Background(), TypeSkill, "target-skill", "")
+	if err != nil {
+		t.Fatalf("GetPublic() error = %v, want target item without loading unrelated items", err)
+	}
+	if item.ID != "target-skill" {
+		t.Fatalf("GetPublic() id = %q, want target-skill", item.ID)
+	}
+}
+
+func TestAdminReviewsFiltersStatusBeforeLoadingItems(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type:         TypeSkill,
+		ID:           "pending-skill",
+		Name:         "Pending Skill",
+		Version:      "1.0.0",
+		ArchiveType:  "zip",
+		ReviewStatus: ReviewStatusPending,
+	}, zipArchive(t, map[string]string{"pending-skill/SKILL.md": "# Pending\n"}))
+	publishMultipart(t, handler, PublishRequest{
+		Type:         TypeSkill,
+		ID:           "rejected-skill",
+		Name:         "Rejected Skill",
+		Version:      "1.0.0",
+		ArchiveType:  "zip",
+		ReviewStatus: ReviewStatusRejected,
+	}, zipArchive(t, map[string]string{"rejected-skill/SKILL.md": "# Rejected\n"}))
+
+	if _, err := app.store.db.ExecContext(context.Background(), `UPDATE items SET metadata_json = '{' WHERE type = ? AND id = ?`, TypeSkill, "rejected-skill"); err != nil {
+		t.Fatalf("corrupt rejected item metadata: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/reviews?status=pending", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pending reviews status = %d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var response CatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode pending reviews: %v", err)
+	}
+	if len(response.Items) != 1 || response.Items[0].ID != "pending-skill" {
+		t.Fatalf("pending reviews = %+v, want only pending-skill", response.Items)
+	}
+}
+
+func TestPublicMarketResponsesDoNotExposeReviewFields(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type:        TypeSkill,
+		ID:          "public-review-demo",
+		Name:        "Public Review Demo",
+		Version:     "1.0.0",
+		ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"public-review-demo/SKILL.md": "# Demo\n"}))
+
+	for _, path := range []string{
+		"/api/v1/catalog",
+		"/api/v1/desktop/catalog",
+		"/api/v1/skills",
+		"/api/v1/skills/public-review-demo",
+		"/api/v1/skills/public-review-demo/versions",
+		"/api/v1/skills/public-review-demo/resolve",
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		body := rec.Body.String()
+		for _, field := range []string{"reviewStatus", "reviewNote", "reviewedAt", "reviewedBy", "creatorId"} {
+			if strings.Contains(body, field) {
+				t.Fatalf("GET %s leaked %s in body=%s", path, field, body)
+			}
+		}
+	}
+}
+
+func TestPublishSkillPackageProfile(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type:        TypeSkill,
+		ID:          "word-helper",
+		Name:        "Word Helper",
+		Version:     "1.0.0",
+		Description: "Edit documents",
+		ArchiveType: "zip",
+		Skill: &SkillProfileSpec{
+			Kind:     SkillKindSingle,
+			Category: "document",
+			Scenario: "productivity",
+			Level:    "beginner",
+		},
+	}, zipArchive(t, map[string]string{"word/SKILL.md": "# Word\n"}))
+	publishMultipart(t, handler, PublishRequest{
+		Type:        TypeSkill,
+		ID:          "excel-analyst",
+		Name:        "Excel Analyst",
+		Version:     "1.0.0",
+		Description: "Analyze sheets",
+		ArchiveType: "zip",
+		Skill: &SkillProfileSpec{
+			Kind:     SkillKindSingle,
+			Category: "data",
+			Scenario: "productivity",
+			Level:    "intermediate",
+		},
+	}, zipArchive(t, map[string]string{"excel/SKILL.md": "# Excel\n"}))
+	publishJSON(t, handler, "/api/v1/admin/skills/publish", PublishRequest{
+		Type:        TypeSkill,
+		ID:          "office-pack",
+		Name:        "Office Pack",
+		Version:     "1.0.0",
+		Description: "Office skill package",
+		Skill: &SkillProfileSpec{
+			Kind:        SkillKindPackage,
+			Category:    "office",
+			Scenario:    "productivity",
+			Level:       "beginner",
+			PackageMode: SkillPackageModeCollection,
+			Featured:    true,
+			IncludedSkills: []SkillPackageItem{
+				{ID: "word-helper"},
+				{ID: "excel-analyst"},
+			},
+		},
+	}, http.StatusOK)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/items/skill/office-pack", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET skill package status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var item PublicItem
+	if err := json.Unmarshal(rec.Body.Bytes(), &item); err != nil {
+		t.Fatalf("decode skill package: %v", err)
+	}
+	if item.Skill == nil || item.Skill.Kind != SkillKindPackage || item.Skill.Category != "office" || item.Skill.PackageMode != SkillPackageModeCollection || !item.Skill.Featured {
+		t.Fatalf("unexpected skill profile: %+v", item.Skill)
+	}
+	if len(item.Skill.IncludedSkills) != 2 || item.Skill.IncludedSkills[0].ID != "word-helper" || item.Skill.IncludedSkills[0].Name != "Word Helper" {
+		t.Fatalf("unexpected included skills: %+v", item.Skill.IncludedSkills)
+	}
+	if item.ADPInstallURL != "" || len(item.Assets) != 0 {
+		t.Fatalf("collection package should not expose artifact install data: adp=%q assets=%+v", item.ADPInstallURL, item.Assets)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/office-pack/package/download", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("download skill package status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	zr, err := zip.NewReader(bytes.NewReader(rec.Body.Bytes()), int64(rec.Body.Len()))
+	if err != nil {
+		t.Fatalf("open skill package zip: %v", err)
+	}
+	entries := map[string]bool{}
+	for _, file := range zr.File {
+		entries[file.Name] = true
+	}
+	for _, name := range []string{
+		"manifest.json",
+		"skills/word-helper/word/SKILL.md",
+		"skills/excel-analyst/excel/SKILL.md",
+		"adp/word-helper.adp.yaml",
+		"adp/excel-analyst.adp.yaml",
+	} {
+		if !entries[name] {
+			t.Fatalf("skill package zip missing %s; entries=%+v", name, entries)
+		}
 	}
 }
 
@@ -673,6 +876,183 @@ func TestFavoriteItemsUseSSOJWTUser(t *testing.T) {
 	}
 }
 
+func TestLocalLoginSeparatesCreatorAndAdminReviewAccess(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type:         TypeSkill,
+		ID:           "pending-demo",
+		Name:         "Pending Demo",
+		Version:      "1.0.0",
+		ArchiveType:  "zip",
+		ReviewStatus: ReviewStatusPending,
+	}, zipArchive(t, map[string]string{"pending-demo/SKILL.md": "# Pending\n"}))
+	publishMultipart(t, handler, PublishRequest{
+		Type:         TypeSkill,
+		ID:           "rejected-demo",
+		Name:         "Rejected Demo",
+		Version:      "1.0.0",
+		ArchiveType:  "zip",
+		ReviewStatus: ReviewStatusRejected,
+	}, zipArchive(t, map[string]string{"rejected-demo/SKILL.md": "# Rejected\n"}))
+
+	creatorToken := loginLocalUser(t, handler, "creator-a", "creator")
+	rawPublish, _ := json.Marshal(PublishRequest{
+		Type:         TypeWebsiteApp,
+		ID:           "creator-submitted",
+		Name:         "Creator Submitted",
+		Version:      "1.0.0",
+		WebsiteKind:  WebsiteKindExternal,
+		Metadata:     map[string]string{"url": "https://example.test/app"},
+		ReviewStatus: ReviewStatusApproved,
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/creator/publish", bytes.NewReader(rawPublish))
+	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("creator publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	otherCreatorToken := loginLocalUser(t, handler, "creator-b", "creator")
+	otherRawPublish, _ := json.Marshal(PublishRequest{
+		Type:        TypeWebsiteApp,
+		ID:          "other-submitted",
+		Name:        "Other Submitted",
+		Version:     "1.0.0",
+		WebsiteKind: WebsiteKindExternal,
+		Metadata:    map[string]string{"url": "https://example.test/other"},
+	})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/creator/publish", bytes.NewReader(otherRawPublish))
+	req.Header.Set("Authorization", "Bearer "+otherCreatorToken)
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("other creator publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/creator/items", nil)
+	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("creator items status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var creatorCatalog CatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &creatorCatalog); err != nil {
+		t.Fatalf("decode creator catalog: %v", err)
+	}
+	statuses := map[string]string{}
+	for _, item := range creatorCatalog.Items {
+		statuses[item.ID] = item.ReviewStatus
+	}
+	if len(creatorCatalog.Items) != 1 || statuses["creator-submitted"] != ReviewStatusPending {
+		t.Fatalf("creator catalog statuses = %+v, want only creator-submitted pending", statuses)
+	}
+	if statuses["pending-demo"] != "" || statuses["rejected-demo"] != "" || statuses["other-submitted"] != "" {
+		t.Fatalf("creator catalog leaked other items: %+v", statuses)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/reviews", nil)
+	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("creator admin reviews status = %d, want 403 body=%s", rec.Code, rec.Body.String())
+	}
+
+	adminToken := loginLocalUser(t, handler, "admin-a", "admin")
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/reviews?status=pending", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin reviews status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var reviewCatalog CatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &reviewCatalog); err != nil {
+		t.Fatalf("decode admin reviews: %v", err)
+	}
+	adminPending := map[string]bool{}
+	for _, item := range reviewCatalog.Items {
+		adminPending[item.ID] = item.ReviewStatus == ReviewStatusPending
+	}
+	if len(reviewCatalog.Items) != 3 || !adminPending["pending-demo"] || !adminPending["creator-submitted"] || !adminPending["other-submitted"] {
+		t.Fatalf("admin pending reviews = %+v, want all pending submissions", reviewCatalog.Items)
+	}
+
+	rawReview, _ := json.Marshal(map[string]string{"status": ReviewStatusApproved, "reviewedBy": "spoofed-admin"})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/reviews/skill/pending-demo", bytes.NewReader(rawReview))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin approve status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var reviewedItem PublicItem
+	if err := json.Unmarshal(rec.Body.Bytes(), &reviewedItem); err != nil {
+		t.Fatalf("decode reviewed item: %v", err)
+	}
+	if reviewedItem.ReviewedBy != "admin-a" {
+		t.Fatalf("reviewedBy = %q, want authenticated admin id", reviewedItem.ReviewedBy)
+	}
+}
+
+func TestCreatorItemsUseStoredCreatorID(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	creatorToken := loginLocalUser(t, handler, "creator-owned", "creator")
+	rawPublish, _ := json.Marshal(PublishRequest{
+		Type:        TypeWebsiteApp,
+		ID:          "creator-owned-app",
+		Name:        "Creator Owned App",
+		Version:     "1.0.0",
+		WebsiteKind: WebsiteKindExternal,
+		Metadata:    map[string]string{"url": "https://example.test/owned", "creatorId": "spoofed-creator"},
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/creator/publish", bytes.NewReader(rawPublish))
+	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("creator publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var storedMetadata string
+	if err := app.store.db.QueryRowContext(context.Background(), `SELECT metadata_json FROM items WHERE type = ? AND id = ?`, TypeWebsiteApp, "creator-owned-app").Scan(&storedMetadata); err != nil {
+		t.Fatalf("read stored metadata: %v", err)
+	}
+	if strings.Contains(storedMetadata, "creatorId") {
+		t.Fatalf("stored metadata contains reserved creatorId: %s", storedMetadata)
+	}
+
+	_, err := app.store.db.ExecContext(context.Background(), `UPDATE items SET metadata_json = ? WHERE type = ? AND id = ?`, `{"url":"https://example.test/owned"}`, TypeWebsiteApp, "creator-owned-app")
+	if err != nil {
+		t.Fatalf("clear item metadata creatorId: %v", err)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/creator/items", nil)
+	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("creator items status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var catalog CatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &catalog); err != nil {
+		t.Fatalf("decode creator catalog: %v", err)
+	}
+	if len(catalog.Items) != 1 || catalog.Items[0].ID != "creator-owned-app" {
+		t.Fatalf("creator catalog items = %+v, want creator-owned-app by stored creator id", catalog.Items)
+	}
+	if _, ok := catalog.Items[0].Metadata["creatorId"]; ok {
+		t.Fatalf("public metadata leaked creatorId: %+v", catalog.Items[0].Metadata)
+	}
+}
+
 func TestSSOJWTAdminAuthAndAudienceValidation(t *testing.T) {
 	privateKey, publicKeyPEM := testSSOJWTKey(t)
 	app := newTestAppWithConfig(t, Config{
@@ -913,7 +1293,7 @@ func TestSandboxTemplateValidation(t *testing.T) {
 	}
 }
 
-func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
+func TestEightMarketTypesPublishListResolveAndDownload(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
 
@@ -965,6 +1345,12 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 					Phase:     DependencyPhaseRuntime,
 					Required:  true,
 					ServiceID: "agent-platform",
+				}, {
+					Kind:     DependencySoftwarePackage,
+					Phase:    DependencyPhaseRuntime,
+					Required: true,
+					ID:       "python-runtime",
+					Version:  ">=3.12",
 				}},
 			},
 			archive: zipArchive(t, map[string]string{"planner/agent.yml": "name: Planner\n"}),
@@ -1035,6 +1421,19 @@ func TestSevenMarketTypesPublishListResolveAndDownload(t *testing.T) {
 				}},
 			},
 			archive: zipArchive(t, map[string]string{"docs/website.json": `{"id":"docs","version":"1.0.0"}`, "docs/index.html": "<h1>Docs</h1>"}),
+		},
+		{
+			path:     "software-packages",
+			itemType: TypeSoftwarePackage,
+			id:       "python-runtime",
+			req: PublishRequest{
+				ID:          "python-runtime",
+				Name:        "Python Runtime",
+				Version:     "3.12.0",
+				Description: "Portable Python runtime package",
+				ArchiveType: "tar.gz",
+			},
+			archive: tarGz(t, map[string]string{"python/bin/python": "#!/bin/sh\n"}),
 		},
 	}
 
@@ -1663,14 +2062,17 @@ func TestADPRejectsLegacyHookSyntax(t *testing.T) {
 
 func TestNormalizeItemTypeAliases(t *testing.T) {
 	cases := map[string]ItemType{
-		"agent":        TypeAgent,
-		"agents":       TypeAgent,
-		"智能体":          TypeAgent,
-		"webapp":       TypeWebsiteApp,
-		"webapps":      TypeWebsiteApp,
-		"website-app":  TypeWebsiteApp,
-		"website-apps": TypeWebsiteApp,
-		"网站应用":         TypeWebsiteApp,
+		"agent":             TypeAgent,
+		"agents":            TypeAgent,
+		"智能体":               TypeAgent,
+		"webapp":            TypeWebsiteApp,
+		"webapps":           TypeWebsiteApp,
+		"website-app":       TypeWebsiteApp,
+		"website-apps":      TypeWebsiteApp,
+		"网站应用":              TypeWebsiteApp,
+		"software-package":  TypeSoftwarePackage,
+		"software-packages": TypeSoftwarePackage,
+		"软件依赖包":             TypeSoftwarePackage,
 	}
 	for input, want := range cases {
 		got, err := normalizeItemType(input)
@@ -1700,6 +2102,32 @@ func favoriteRequest(t *testing.T, handler http.Handler, method, path, userID st
 		t.Fatalf("decode favorite response: %v", err)
 	}
 	return item
+}
+
+func loginLocalUser(t *testing.T, handler http.Handler, userID, role string) string {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]string{"userId": userID, "role": role})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("local login status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Token string `json:"token"`
+		User  struct {
+			ID   string `json:"id"`
+			Role string `json:"role"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode local login: %v", err)
+	}
+	if response.Token == "" || response.User.ID != userID || response.User.Role != role {
+		t.Fatalf("local login response = %+v", response)
+	}
+	return response.Token
 }
 
 func setProxyUser(req *http.Request, userID string) {

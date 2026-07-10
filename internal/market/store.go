@@ -51,12 +51,17 @@ func (s *Store) migrate(ctx context.Context) error {
 			readme TEXT NOT NULL DEFAULT '',
 			latest_version TEXT NOT NULL,
 			min_desktop_version TEXT NOT NULL DEFAULT '',
-			sandbox_kind TEXT NOT NULL DEFAULT '',
-			website_kind TEXT NOT NULL DEFAULT '',
-			metadata_json TEXT NOT NULL DEFAULT '{}',
+				sandbox_kind TEXT NOT NULL DEFAULT '',
+				website_kind TEXT NOT NULL DEFAULT '',
+				creator_id TEXT NOT NULL DEFAULT '',
+				metadata_json TEXT NOT NULL DEFAULT '{}',
 			dependencies_json TEXT NOT NULL DEFAULT '[]',
 			protocol_json TEXT NOT NULL DEFAULT '{}',
 			adp_yaml TEXT NOT NULL DEFAULT '',
+			review_status TEXT NOT NULL DEFAULT 'approved',
+			review_note TEXT NOT NULL DEFAULT '',
+			reviewed_at TEXT NOT NULL DEFAULT '',
+			reviewed_by TEXT NOT NULL DEFAULT '',
 			published INTEGER NOT NULL DEFAULT 1,
 			published_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
@@ -65,13 +70,18 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS versions (
 			item_type TEXT NOT NULL,
 			item_id TEXT NOT NULL,
-			version TEXT NOT NULL,
-			description TEXT NOT NULL DEFAULT '',
+				version TEXT NOT NULL,
+				creator_id TEXT NOT NULL DEFAULT '',
+				description TEXT NOT NULL DEFAULT '',
 			readme TEXT NOT NULL DEFAULT '',
 			metadata_json TEXT NOT NULL DEFAULT '{}',
 			dependencies_json TEXT NOT NULL DEFAULT '[]',
 			protocol_json TEXT NOT NULL DEFAULT '{}',
 			adp_yaml TEXT NOT NULL DEFAULT '',
+			review_status TEXT NOT NULL DEFAULT 'approved',
+			review_note TEXT NOT NULL DEFAULT '',
+			reviewed_at TEXT NOT NULL DEFAULT '',
+			reviewed_by TEXT NOT NULL DEFAULT '',
 			published INTEGER NOT NULL DEFAULT 1,
 			published_at TEXT NOT NULL,
 			PRIMARY KEY (item_type, item_id, version)
@@ -132,8 +142,28 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			PRIMARY KEY (item_type, item_id, user_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS skill_profiles (
+			item_type TEXT NOT NULL,
+			item_id TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			category TEXT NOT NULL,
+			scenario TEXT NOT NULL DEFAULT '',
+			level TEXT NOT NULL DEFAULT '',
+			package_mode TEXT NOT NULL DEFAULT '',
+			featured INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (item_type, item_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS skill_package_items (
+			package_type TEXT NOT NULL,
+			package_id TEXT NOT NULL,
+			skill_id TEXT NOT NULL,
+			optional INTEGER NOT NULL DEFAULT 0,
+			sort_order INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (package_type, package_id, skill_id)
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_download_events_item ON download_events (item_type, item_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_favorite_items_item ON favorite_items (item_type, item_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_skill_profiles_category ON skill_profiles (kind, category)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -141,6 +171,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	if err := s.ensureColumn(ctx, "items", "website_kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "items", "creator_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "items", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
@@ -155,7 +188,22 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "items", "adp_yaml", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "items", "review_status", "TEXT NOT NULL DEFAULT 'approved'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "items", "review_note", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "items", "reviewed_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "items", "reviewed_by", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "versions", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "versions", "creator_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "versions", "dependencies_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
@@ -165,6 +213,24 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "versions", "adp_yaml", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "versions", "review_status", "TEXT NOT NULL DEFAULT 'approved'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "versions", "review_note", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "versions", "reviewed_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "versions", "reviewed_by", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_items_creator ON items (creator_id)`); err != nil {
+		return err
+	}
+	if err := s.backfillCreatorIDs(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "artifacts", "asset_role", "TEXT NOT NULL DEFAULT 'primary'"); err != nil {
@@ -183,6 +249,50 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if err := s.backfillVersionPlatforms(ctx); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (s *Store) backfillCreatorIDs(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT type, id, metadata_json FROM items WHERE creator_id = ''`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type creatorBackfill struct {
+		itemType  ItemType
+		id        string
+		creatorID string
+	}
+	var updates []creatorBackfill
+	for rows.Next() {
+		var rawType, id, metadataJSON string
+		if err := rows.Scan(&rawType, &id, &metadataJSON); err != nil {
+			return err
+		}
+		var metadata map[string]string
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			continue
+		}
+		creatorID := strings.TrimSpace(metadata["creatorId"])
+		if creatorID == "" {
+			continue
+		}
+		updates = append(updates, creatorBackfill{itemType: ItemType(rawType), id: id, creatorID: creatorID})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := s.db.ExecContext(ctx, `UPDATE items SET creator_id = ? WHERE type = ? AND id = ? AND creator_id = ''`, update.creatorID, update.itemType, update.id); err != nil {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE versions SET creator_id = ? WHERE item_type = ? AND item_id = ? AND creator_id = ''`, update.creatorID, update.itemType, update.id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -330,7 +440,16 @@ func (s *Store) ensureColumn(ctx context.Context, table, column, definition stri
 func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *storedArtifact) error {
 	req.Version = canonicalVersion(req.Version)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	metadataJSON, err := encodeJSONText(req.Metadata, "{}")
+	reviewStatus := normalizeReviewStatus(req.ReviewStatus, ReviewStatusApproved)
+	published := 0
+	reviewedAt := ""
+	reviewedBy := ""
+	if reviewStatus == ReviewStatusApproved {
+		published = 1
+		reviewedAt = now
+		reviewedBy = "admin"
+	}
+	metadataJSON, err := encodeJSONText(storageMetadata(req.Metadata), "{}")
 	if err != nil {
 		return err
 	}
@@ -376,38 +495,49 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 		}
 	}()
 
+	creatorID := strings.TrimSpace(req.CreatorID)
 	if _, err = tx.ExecContext(ctx, `INSERT INTO items (
-		type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, metadata_json, dependencies_json, protocol_json, adp_yaml, published, published_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-	ON CONFLICT(type, id) DO UPDATE SET
-		name = excluded.name,
-		description = excluded.description,
-		readme = excluded.readme,
-		latest_version = excluded.latest_version,
-		min_desktop_version = excluded.min_desktop_version,
-		sandbox_kind = excluded.sandbox_kind,
-		website_kind = excluded.website_kind,
-		metadata_json = excluded.metadata_json,
-		dependencies_json = excluded.dependencies_json,
-		protocol_json = excluded.protocol_json,
+			type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, published_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+		ON CONFLICT(type, id) DO UPDATE SET
+			name = excluded.name,
+			description = excluded.description,
+			readme = excluded.readme,
+			latest_version = excluded.latest_version,
+			min_desktop_version = excluded.min_desktop_version,
+			sandbox_kind = excluded.sandbox_kind,
+			website_kind = excluded.website_kind,
+			creator_id = excluded.creator_id,
+			metadata_json = excluded.metadata_json,
+			dependencies_json = excluded.dependencies_json,
+			protocol_json = excluded.protocol_json,
 		adp_yaml = excluded.adp_yaml,
-		published = 1,
+		review_status = excluded.review_status,
+		review_note = excluded.review_note,
+		reviewed_at = excluded.reviewed_at,
+		reviewed_by = excluded.reviewed_by,
+		published = excluded.published,
 		updated_at = excluded.updated_at`,
-		req.Type, req.ID, req.Name, req.Description, req.Readme, req.Version, req.MinDesktopVersion, req.SandboxKind, req.WebsiteKind, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), now, now); err != nil {
+		req.Type, req.ID, req.Name, req.Description, req.Readme, req.Version, req.MinDesktopVersion, req.SandboxKind, req.WebsiteKind, creatorID, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), reviewStatus, reviewedAt, reviewedBy, published, now, now); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO versions (
-		item_type, item_id, version, description, readme, metadata_json, dependencies_json, protocol_json, adp_yaml, published, published_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-	ON CONFLICT(item_type, item_id, version) DO UPDATE SET
-		description = excluded.description,
-		readme = excluded.readme,
+			item_type, item_id, version, creator_id, description, readme, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, published_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
+		ON CONFLICT(item_type, item_id, version) DO UPDATE SET
+			creator_id = excluded.creator_id,
+			description = excluded.description,
+			readme = excluded.readme,
 		metadata_json = excluded.metadata_json,
 		dependencies_json = excluded.dependencies_json,
 		protocol_json = excluded.protocol_json,
 		adp_yaml = excluded.adp_yaml,
-		published = 1`,
-		req.Type, req.ID, req.Version, req.Description, req.Readme, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), now); err != nil {
+		review_status = excluded.review_status,
+		review_note = excluded.review_note,
+		reviewed_at = excluded.reviewed_at,
+		reviewed_by = excluded.reviewed_by,
+		published = excluded.published`,
+		req.Type, req.ID, req.Version, creatorID, req.Description, req.Readme, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), reviewStatus, reviewedAt, reviewedBy, published, now); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO version_platforms (
@@ -437,6 +567,49 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO tags (item_type, item_id, tag) VALUES (?, ?, ?)`, req.Type, req.ID, tag); err != nil {
 			return err
+		}
+	}
+	if req.Type == TypeSkill {
+		profile := req.Skill
+		if profile == nil {
+			profile = defaultSkillProfile()
+		}
+		featured := 0
+		if profile.Featured {
+			featured = 1
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO skill_profiles (
+			item_type, item_id, kind, category, scenario, level, package_mode, featured
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(item_type, item_id) DO UPDATE SET
+			kind = excluded.kind,
+			category = excluded.category,
+			scenario = excluded.scenario,
+			level = excluded.level,
+			package_mode = excluded.package_mode,
+			featured = excluded.featured`,
+			req.Type, req.ID, profile.Kind, profile.Category, profile.Scenario, profile.Level, profile.PackageMode, featured); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM skill_package_items WHERE package_type = ? AND package_id = ?`, req.Type, req.ID); err != nil {
+			return err
+		}
+		if profile.Kind == SkillKindPackage {
+			for index, included := range profile.IncludedSkills {
+				sortOrder := included.SortOrder
+				if sortOrder == 0 {
+					sortOrder = index + 1
+				}
+				optional := 0
+				if included.Optional {
+					optional = 1
+				}
+				if _, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO skill_package_items (
+					package_type, package_id, skill_id, optional, sort_order
+				) VALUES (?, ?, ?, ?, ?)`, req.Type, req.ID, included.ID, optional, sortOrder); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	if artifact != nil {
@@ -473,13 +646,72 @@ func (s *Store) Unpublish(ctx context.Context, itemType ItemType, id, version st
 	return err
 }
 
+func (s *Store) UpdateReview(ctx context.Context, itemType ItemType, id, status, note, reviewer string) error {
+	status = normalizeReviewStatus(status, "")
+	if status == "" {
+		return errors.New("invalid review status")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	reviewer = strings.TrimSpace(reviewer)
+	if reviewer == "" {
+		reviewer = "admin"
+	}
+	published := 0
+	if status == ReviewStatusApproved {
+		published = 1
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE items SET review_status = ?, review_note = ?, reviewed_at = ?, reviewed_by = ?, published = ?, updated_at = ? WHERE type = ? AND id = ?`,
+		status, strings.TrimSpace(note), now, reviewer, published, now, itemType, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE versions SET review_status = ?, review_note = ?, reviewed_at = ?, reviewed_by = ?, published = ? WHERE item_type = ? AND item_id = ? AND version = (SELECT latest_version FROM items WHERE type = ? AND id = ?)`,
+		status, strings.TrimSpace(note), now, reviewer, published, itemType, id, itemType, id)
+	return err
+}
+
 func (s *Store) ListPublic(ctx context.Context, onlyType ItemType, viewerUserID string) ([]storedItem, error) {
-	query := `SELECT type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, metadata_json, dependencies_json, protocol_json, adp_yaml, published, published_at, updated_at
-		FROM items WHERE published = 1`
+	return s.listItems(ctx, onlyType, "", viewerUserID, true, "")
+}
+
+func (s *Store) ListAdmin(ctx context.Context, onlyType ItemType, reviewStatus, viewerUserID string) ([]storedItem, error) {
+	return s.listItems(ctx, onlyType, reviewStatus, viewerUserID, false, "")
+}
+
+func (s *Store) ListCreator(ctx context.Context, creatorID, viewerUserID string) ([]storedItem, error) {
+	return s.listItems(ctx, "", "", viewerUserID, false, strings.TrimSpace(creatorID))
+}
+
+func (s *Store) listItems(ctx context.Context, onlyType ItemType, reviewStatus, viewerUserID string, publicOnly bool, creatorID string) ([]storedItem, error) {
+	query := `SELECT type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, published_at, updated_at
+			FROM items`
 	args := []any{}
+	conditions := []string{}
+	if publicOnly {
+		conditions = append(conditions, `published = 1`, `review_status = ?`)
+		args = append(args, ReviewStatusApproved)
+	}
 	if onlyType != "" {
-		query += ` AND type = ?`
+		conditions = append(conditions, `type = ?`)
 		args = append(args, onlyType)
+	}
+	if reviewStatus != "" {
+		conditions = append(conditions, `review_status = ?`)
+		args = append(args, reviewStatus)
+	}
+	if creatorID != "" {
+		conditions = append(conditions, `creator_id = ?`)
+		args = append(args, creatorID)
+	}
+	if len(conditions) > 0 {
+		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
 	query += ` ORDER BY type, name COLLATE NOCASE`
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -489,17 +721,8 @@ func (s *Store) ListPublic(ctx context.Context, onlyType ItemType, viewerUserID 
 	defer rows.Close()
 	var items []storedItem
 	for rows.Next() {
-		var item storedItem
-		var published int
-		var publishedAt, updatedAt string
-		var metadataJSON, dependenciesJSON, protocolJSON string
-		if err := rows.Scan(&item.Type, &item.ID, &item.Name, &item.Description, &item.Readme, &item.LatestVersion, &item.MinDesktopVersion, &item.SandboxKind, &item.WebsiteKind, &metadataJSON, &dependenciesJSON, &protocolJSON, &item.ADPYAML, &published, &publishedAt, &updatedAt); err != nil {
-			return nil, err
-		}
-		item.Published = published == 1
-		item.PublishedAt = parseTime(publishedAt)
-		item.UpdatedAt = parseTime(updatedAt)
-		if err := decodeItemJSON(&item, metadataJSON, dependenciesJSON, protocolJSON); err != nil {
+		item, err := scanStoredItem(rows)
+		if err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -510,38 +733,69 @@ func (s *Store) ListPublic(ctx context.Context, onlyType ItemType, viewerUserID 
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	if err := s.loadTagsForItems(ctx, items, onlyType); err != nil {
-		return nil, err
-	}
-	if err := s.loadAssetsForItems(ctx, items, onlyType); err != nil {
-		return nil, err
-	}
-	if err := s.loadPlatformsForItems(ctx, items, onlyType); err != nil {
-		return nil, err
-	}
-	if err := s.loadStatsForItems(ctx, items, onlyType, viewerUserID); err != nil {
+	if err := s.hydrateItems(ctx, items, onlyType, viewerUserID, publicOnly); err != nil {
 		return nil, err
 	}
 	return items, nil
 }
 
 func (s *Store) GetPublic(ctx context.Context, itemType ItemType, id, viewerUserID string) (storedItem, error) {
-	items, err := s.ListPublic(ctx, itemType, viewerUserID)
+	row := s.db.QueryRowContext(ctx, `SELECT type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, published_at, updated_at
+		FROM items WHERE type = ? AND id = ? AND published = 1 AND review_status = ?`, itemType, id, ReviewStatusApproved)
+	item, err := scanStoredItem(row)
 	if err != nil {
 		return storedItem{}, err
 	}
-	for _, item := range items {
-		if item.ID == id {
-			return item, nil
-		}
+	items := []storedItem{item}
+	if err := s.hydrateItems(ctx, items, itemType, viewerUserID, true); err != nil {
+		return storedItem{}, err
 	}
-	return storedItem{}, sql.ErrNoRows
+	return items[0], nil
+}
+
+type itemScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanStoredItem(scanner itemScanner) (storedItem, error) {
+	var item storedItem
+	var published int
+	var publishedAt, updatedAt, reviewedAt string
+	var metadataJSON, dependenciesJSON, protocolJSON string
+	if err := scanner.Scan(&item.Type, &item.ID, &item.Name, &item.Description, &item.Readme, &item.LatestVersion, &item.MinDesktopVersion, &item.SandboxKind, &item.WebsiteKind, &item.CreatorID, &metadataJSON, &dependenciesJSON, &protocolJSON, &item.ADPYAML, &item.ReviewStatus, &item.ReviewNote, &reviewedAt, &item.ReviewedBy, &published, &publishedAt, &updatedAt); err != nil {
+		return storedItem{}, err
+	}
+	item.ReviewStatus = normalizeReviewStatus(item.ReviewStatus, ReviewStatusApproved)
+	item.Published = published == 1
+	item.PublishedAt = parseTime(publishedAt)
+	item.UpdatedAt = parseTime(updatedAt)
+	item.ReviewedAt = parseTime(reviewedAt)
+	if err := decodeItemJSON(&item, metadataJSON, dependenciesJSON, protocolJSON); err != nil {
+		return storedItem{}, err
+	}
+	return item, nil
+}
+
+func (s *Store) hydrateItems(ctx context.Context, items []storedItem, onlyType ItemType, viewerUserID string, publicOnly bool) error {
+	if err := s.loadTagsForItems(ctx, items, onlyType, publicOnly); err != nil {
+		return err
+	}
+	if err := s.loadAssetsForItems(ctx, items, onlyType, publicOnly); err != nil {
+		return err
+	}
+	if err := s.loadPlatformsForItems(ctx, items, onlyType, publicOnly); err != nil {
+		return err
+	}
+	if err := s.loadSkillProfilesForItems(ctx, items, onlyType, publicOnly); err != nil {
+		return err
+	}
+	return s.loadStatsForItems(ctx, items, onlyType, viewerUserID, publicOnly)
 }
 
 func (s *Store) GetADPYAML(ctx context.Context, itemType ItemType, id, version string) (string, error) {
 	version = canonicalVersion(version)
 	if version == "" {
-		row := s.db.QueryRowContext(ctx, `SELECT adp_yaml FROM items WHERE type = ? AND id = ? AND published = 1`, itemType, id)
+		row := s.db.QueryRowContext(ctx, `SELECT adp_yaml FROM items WHERE type = ? AND id = ? AND published = 1 AND review_status = ?`, itemType, id, ReviewStatusApproved)
 		var value string
 		if err := row.Scan(&value); err != nil {
 			return "", err
@@ -551,7 +805,7 @@ func (s *Store) GetADPYAML(ctx context.Context, itemType ItemType, id, version s
 		}
 		return value, nil
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT adp_yaml FROM versions WHERE item_type = ? AND item_id = ? AND version = ? AND published = 1`, itemType, id, version)
+	row := s.db.QueryRowContext(ctx, `SELECT adp_yaml FROM versions WHERE item_type = ? AND item_id = ? AND version = ? AND published = 1 AND review_status = ?`, itemType, id, version, ReviewStatusApproved)
 	var value string
 	if err := row.Scan(&value); err != nil {
 		return "", err
@@ -565,7 +819,7 @@ func (s *Store) GetADPYAML(ctx context.Context, itemType ItemType, id, version s
 func (s *Store) GetArtifact(ctx context.Context, itemType ItemType, id, version, platform string) (storedArtifact, error) {
 	version = canonicalVersion(version)
 	if version == "" {
-		row := s.db.QueryRowContext(ctx, `SELECT latest_version FROM items WHERE type = ? AND id = ? AND published = 1`, itemType, id)
+		row := s.db.QueryRowContext(ctx, `SELECT latest_version FROM items WHERE type = ? AND id = ? AND published = 1 AND review_status = ?`, itemType, id, ReviewStatusApproved)
 		if err := row.Scan(&version); err != nil {
 			return storedArtifact{}, err
 		}
@@ -596,7 +850,7 @@ func (s *Store) getArtifact(ctx context.Context, itemType ItemType, id, version,
 func (s *Store) GetPlatform(ctx context.Context, itemType ItemType, id, version, platform string) (PublicPlatform, error) {
 	version = canonicalVersion(version)
 	if version == "" {
-		row := s.db.QueryRowContext(ctx, `SELECT latest_version FROM items WHERE type = ? AND id = ? AND published = 1`, itemType, id)
+		row := s.db.QueryRowContext(ctx, `SELECT latest_version FROM items WHERE type = ? AND id = ? AND published = 1 AND review_status = ?`, itemType, id, ReviewStatusApproved)
 		if err := row.Scan(&version); err != nil {
 			return PublicPlatform{}, err
 		}
@@ -654,14 +908,14 @@ func (s *Store) UnfavoriteItem(ctx context.Context, itemType ItemType, id, userI
 }
 
 func (s *Store) ensurePublishedItem(ctx context.Context, itemType ItemType, id string) error {
-	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM items WHERE type = ? AND id = ? AND published = 1`, itemType, id)
+	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM items WHERE type = ? AND id = ? AND published = 1 AND review_status = ?`, itemType, id, ReviewStatusApproved)
 	var exists int
 	return row.Scan(&exists)
 }
 
 func (s *Store) ListVersions(ctx context.Context, itemType ItemType, id string) ([]PublicVersion, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT version, description, readme, metadata_json, dependencies_json, published_at
-		FROM versions WHERE item_type = ? AND item_id = ? AND published = 1 ORDER BY published_at DESC, version DESC`, itemType, id)
+		FROM versions WHERE item_type = ? AND item_id = ? AND published = 1 AND review_status = ? ORDER BY published_at DESC, version DESC`, itemType, id, ReviewStatusApproved)
 	if err != nil {
 		return nil, err
 	}
@@ -700,46 +954,6 @@ func (s *Store) ListVersions(ctx context.Context, itemType ItemType, id string) 
 	return versions, nil
 }
 
-func (s *Store) tags(ctx context.Context, itemType ItemType, id string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT tag FROM tags WHERE item_type = ? AND item_id = ? ORDER BY tag COLLATE NOCASE`, itemType, id)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var tags []string
-	for rows.Next() {
-		var tag string
-		if err := rows.Scan(&tag); err != nil {
-			return nil, err
-		}
-		tags = append(tags, tag)
-	}
-	return tags, rows.Err()
-}
-
-func (s *Store) assets(ctx context.Context, itemType ItemType, id, version string) (map[string]PublicAsset, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT platform_key, archive_type, asset_role, url, sha256, integrity, size_bytes
-		FROM artifacts WHERE item_type = ? AND item_id = ? AND version = ? ORDER BY asset_role, platform_key`, itemType, id, version)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	assets := map[string]PublicAsset{}
-	for rows.Next() {
-		var key string
-		var asset PublicAsset
-		if err := rows.Scan(&key, &asset.ArchiveType, &asset.Role, &asset.URL, &asset.SHA256, &asset.Integrity, &asset.SizeBytes); err != nil {
-			return nil, err
-		}
-		asset.Platform = key
-		if asset.Role != "" && asset.Role != AssetRolePrimary {
-			key = asset.Role
-		}
-		assets[key] = asset
-	}
-	return assets, rows.Err()
-}
-
 type itemLookupKey struct {
 	itemType ItemType
 	id       string
@@ -751,7 +965,7 @@ type versionLookupKey struct {
 	version  string
 }
 
-func (s *Store) loadTagsForItems(ctx context.Context, items []storedItem, onlyType ItemType) error {
+func (s *Store) loadTagsForItems(ctx context.Context, items []storedItem, onlyType ItemType, publicOnly bool) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -761,11 +975,18 @@ func (s *Store) loadTagsForItems(ctx context.Context, items []storedItem, onlyTy
 	}
 	query := `SELECT t.item_type, t.item_id, t.tag
 		FROM tags t
-		JOIN items i ON i.type = t.item_type AND i.id = t.item_id
-		WHERE i.published = 1`
+		JOIN items i ON i.type = t.item_type AND i.id = t.item_id`
 	args := []any{}
+	if publicOnly {
+		query += ` WHERE i.published = 1 AND i.review_status = ?`
+		args = append(args, ReviewStatusApproved)
+	}
 	if onlyType != "" {
-		query += ` AND i.type = ?`
+		if publicOnly {
+			query += ` AND i.type = ?`
+		} else {
+			query += ` WHERE i.type = ?`
+		}
 		args = append(args, onlyType)
 	}
 	query += ` ORDER BY t.item_type, t.item_id, t.tag COLLATE NOCASE`
@@ -786,7 +1007,7 @@ func (s *Store) loadTagsForItems(ctx context.Context, items []storedItem, onlyTy
 	return rows.Err()
 }
 
-func (s *Store) loadAssetsForItems(ctx context.Context, items []storedItem, onlyType ItemType) error {
+func (s *Store) loadAssetsForItems(ctx context.Context, items []storedItem, onlyType ItemType, publicOnly bool) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -797,11 +1018,18 @@ func (s *Store) loadAssetsForItems(ctx context.Context, items []storedItem, only
 	}
 	query := `SELECT a.item_type, a.item_id, a.version, a.platform_key, a.archive_type, a.asset_role, a.url, a.sha256, a.integrity, a.size_bytes
 		FROM artifacts a
-		JOIN items i ON i.type = a.item_type AND i.id = a.item_id AND i.latest_version = a.version
-		WHERE i.published = 1`
+		JOIN items i ON i.type = a.item_type AND i.id = a.item_id AND i.latest_version = a.version`
 	args := []any{}
+	if publicOnly {
+		query += ` WHERE i.published = 1 AND i.review_status = ?`
+		args = append(args, ReviewStatusApproved)
+	}
 	if onlyType != "" {
-		query += ` AND i.type = ?`
+		if publicOnly {
+			query += ` AND i.type = ?`
+		} else {
+			query += ` WHERE i.type = ?`
+		}
 		args = append(args, onlyType)
 	}
 	query += ` ORDER BY a.item_type, a.item_id, a.version, a.asset_role, a.platform_key`
@@ -855,7 +1083,94 @@ func (s *Store) loadAssetsForVersions(ctx context.Context, itemType ItemType, id
 	return rows.Err()
 }
 
-func (s *Store) loadPlatformsForItems(ctx context.Context, items []storedItem, onlyType ItemType) error {
+func (s *Store) loadSkillProfilesForItems(ctx context.Context, items []storedItem, onlyType ItemType, publicOnly bool) error {
+	if len(items) == 0 {
+		return nil
+	}
+	index := make(map[itemLookupKey]int, len(items))
+	for i := range items {
+		if items[i].Type == TypeSkill {
+			items[i].Skill = &PublicSkillProfile{Kind: SkillKindSingle, Category: "other"}
+			index[itemLookupKey{itemType: items[i].Type, id: items[i].ID}] = i
+		}
+	}
+	if len(index) == 0 || (onlyType != "" && onlyType != TypeSkill) {
+		return nil
+	}
+	query := `SELECT sp.item_type, sp.item_id, sp.kind, sp.category, sp.scenario, sp.level, sp.package_mode, sp.featured
+		FROM skill_profiles sp
+		JOIN items i ON i.type = sp.item_type AND i.id = sp.item_id
+		WHERE sp.item_type = ?`
+	args := []any{TypeSkill}
+	if publicOnly {
+		query += ` AND i.published = 1 AND i.review_status = ?`
+		args = append(args, ReviewStatusApproved)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rawType, id string
+		var profile PublicSkillProfile
+		var featured int
+		if err := rows.Scan(&rawType, &id, &profile.Kind, &profile.Category, &profile.Scenario, &profile.Level, &profile.PackageMode, &featured); err != nil {
+			return err
+		}
+		profile.Featured = featured == 1
+		key := itemLookupKey{itemType: ItemType(rawType), id: id}
+		if itemIndex, ok := index[key]; ok {
+			items[itemIndex].Skill = &profile
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	return s.loadSkillPackageItemsForItems(ctx, items, index, publicOnly)
+}
+
+func (s *Store) loadSkillPackageItemsForItems(ctx context.Context, items []storedItem, index map[itemLookupKey]int, publicOnly bool) error {
+	query := `SELECT spi.package_type, spi.package_id, spi.skill_id, COALESCE(i.name, ''), spi.optional, spi.sort_order
+		FROM skill_package_items spi
+		LEFT JOIN items i ON i.type = ? AND i.id = spi.skill_id`
+	if publicOnly {
+		query += ` AND i.published = 1 AND i.review_status = ?`
+	}
+	query += ` ORDER BY spi.package_type, spi.package_id, spi.sort_order, spi.skill_id`
+	args := []any{TypeSkill}
+	if publicOnly {
+		args = append(args, ReviewStatusApproved)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rawType, packageID, skillID, name string
+		var optional, sortOrder int
+		if err := rows.Scan(&rawType, &packageID, &skillID, &name, &optional, &sortOrder); err != nil {
+			return err
+		}
+		itemIndex, ok := index[itemLookupKey{itemType: ItemType(rawType), id: packageID}]
+		if !ok || items[itemIndex].Skill == nil || items[itemIndex].Skill.Kind != SkillKindPackage {
+			continue
+		}
+		items[itemIndex].Skill.IncludedSkills = append(items[itemIndex].Skill.IncludedSkills, PublicSkillPackageItem{
+			ID:        skillID,
+			Name:      name,
+			Optional:  optional == 1,
+			SortOrder: sortOrder,
+		})
+	}
+	return rows.Err()
+}
+
+func (s *Store) loadPlatformsForItems(ctx context.Context, items []storedItem, onlyType ItemType, publicOnly bool) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -866,11 +1181,18 @@ func (s *Store) loadPlatformsForItems(ctx context.Context, items []storedItem, o
 	}
 	query := `SELECT p.item_type, p.item_id, p.version, p.platform_key, p.os, p.arch, p.description, p.readme, p.min_desktop_version, p.metadata_json, p.dependencies_json, p.protocol_json
 		FROM version_platforms p
-		JOIN items i ON i.type = p.item_type AND i.id = p.item_id AND i.latest_version = p.version
-		WHERE i.published = 1 AND p.published = 1`
+		JOIN items i ON i.type = p.item_type AND i.id = p.item_id AND i.latest_version = p.version`
 	args := []any{}
+	if publicOnly {
+		query += ` WHERE i.published = 1 AND i.review_status = ? AND p.published = 1`
+		args = append(args, ReviewStatusApproved)
+	}
 	if onlyType != "" {
-		query += ` AND i.type = ?`
+		if publicOnly {
+			query += ` AND i.type = ?`
+		} else {
+			query += ` WHERE i.type = ?`
+		}
 		args = append(args, onlyType)
 	}
 	query += ` ORDER BY p.item_type, p.item_id, p.version, p.platform_key`
@@ -898,7 +1220,7 @@ func (s *Store) loadPlatformsForItems(ctx context.Context, items []storedItem, o
 	return rows.Err()
 }
 
-func (s *Store) loadStatsForItems(ctx context.Context, items []storedItem, onlyType ItemType, viewerUserID string) error {
+func (s *Store) loadStatsForItems(ctx context.Context, items []storedItem, onlyType ItemType, viewerUserID string, publicOnly bool) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -909,11 +1231,18 @@ func (s *Store) loadStatsForItems(ctx context.Context, items []storedItem, onlyT
 
 	downloadQuery := `SELECT d.item_type, d.item_id, COUNT(*)
 		FROM download_events d
-		JOIN items i ON i.type = d.item_type AND i.id = d.item_id
-		WHERE i.published = 1`
+		JOIN items i ON i.type = d.item_type AND i.id = d.item_id`
 	args := []any{}
+	if publicOnly {
+		downloadQuery += ` WHERE i.published = 1 AND i.review_status = ?`
+		args = append(args, ReviewStatusApproved)
+	}
 	if onlyType != "" {
-		downloadQuery += ` AND i.type = ?`
+		if publicOnly {
+			downloadQuery += ` AND i.type = ?`
+		} else {
+			downloadQuery += ` WHERE i.type = ?`
+		}
 		args = append(args, onlyType)
 	}
 	downloadQuery += ` GROUP BY d.item_type, d.item_id`
@@ -942,11 +1271,18 @@ func (s *Store) loadStatsForItems(ctx context.Context, items []storedItem, onlyT
 
 	favoriteQuery := `SELECT f.item_type, f.item_id, COUNT(*)
 		FROM favorite_items f
-		JOIN items i ON i.type = f.item_type AND i.id = f.item_id
-		WHERE i.published = 1`
+		JOIN items i ON i.type = f.item_type AND i.id = f.item_id`
 	args = []any{}
+	if publicOnly {
+		favoriteQuery += ` WHERE i.published = 1 AND i.review_status = ?`
+		args = append(args, ReviewStatusApproved)
+	}
 	if onlyType != "" {
-		favoriteQuery += ` AND i.type = ?`
+		if publicOnly {
+			favoriteQuery += ` AND i.type = ?`
+		} else {
+			favoriteQuery += ` WHERE i.type = ?`
+		}
 		args = append(args, onlyType)
 	}
 	favoriteQuery += ` GROUP BY f.item_type, f.item_id`
@@ -1086,6 +1422,23 @@ func decodeItemJSON(item *storedItem, metadataJSON, dependenciesJSON, protocolJS
 	return nil
 }
 
+func storageMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		if strings.EqualFold(strings.TrimSpace(key), "creatorId") {
+			continue
+		}
+		result[key] = value
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
 func decodePlatformJSON(spec *PublicPlatform, metadataJSON, dependenciesJSON, protocolJSON string) error {
 	if err := decodeJSONText(metadataJSON, &spec.Metadata); err != nil {
 		return err
@@ -1171,6 +1524,8 @@ func normalizeItemType(value string) (ItemType, error) {
 		return TypeCLITool, nil
 	case "website-app", "website-apps", "website", "websites", "webapp", "webapps", "网站应用":
 		return TypeWebsiteApp, nil
+	case "software-package", "software-packages", "software", "softwares", "dependency-package", "dependency-packages", "软件依赖包":
+		return TypeSoftwarePackage, nil
 	default:
 		return "", fmt.Errorf("unsupported item type %q", value)
 	}
@@ -1181,6 +1536,19 @@ func itemAuthor(item storedItem) string {
 		return ""
 	}
 	return strings.TrimSpace(item.Metadata["author"])
+}
+
+func normalizeReviewStatus(status, fallback string) string {
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case ReviewStatusPending:
+		return ReviewStatusPending
+	case ReviewStatusApproved:
+		return ReviewStatusApproved
+	case ReviewStatusRejected:
+		return ReviewStatusRejected
+	default:
+		return fallback
+	}
 }
 
 func publicItem(item storedItem) PublicItem {
@@ -1200,11 +1568,16 @@ func publicItem(item storedItem) PublicItem {
 		Assets:            item.Assets,
 		Platforms:         item.Platforms,
 		Dependencies:      item.Dependencies,
-		Metadata:          item.Metadata,
+		Metadata:          publicMetadata(item.Metadata),
 		Install:           item.Install,
 		Uninstall:         item.Uninstall,
 		Detect:            item.Detect,
+		Skill:             item.Skill,
 		ADPInstallURL:     adpInstallURL(item.Type, item.ID, item.ADPYAML),
+		ReviewStatus:      item.ReviewStatus,
+		ReviewNote:        item.ReviewNote,
+		ReviewedAt:        timePtr(item.ReviewedAt),
+		ReviewedBy:        item.ReviewedBy,
 		CreatedAt:         item.PublishedAt,
 		PublishedAt:       item.PublishedAt,
 		UpdatedAt:         item.UpdatedAt,
@@ -1212,6 +1585,39 @@ func publicItem(item storedItem) PublicItem {
 		FavoriteCount:     item.FavoriteCount,
 		Favorited:         item.Favorited,
 	}
+}
+
+func marketItem(item storedItem) PublicItem {
+	result := publicItem(item)
+	result.ReviewStatus = ""
+	result.ReviewNote = ""
+	result.ReviewedAt = nil
+	result.ReviewedBy = ""
+	return result
+}
+
+func timePtr(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return &value
+}
+
+func publicMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		if strings.EqualFold(strings.TrimSpace(key), "creatorId") {
+			continue
+		}
+		result[key] = value
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func adpInstallURL(itemType ItemType, id string, adpYAML string) string {
@@ -1230,6 +1636,14 @@ func publicItems(items []storedItem) []PublicItem {
 	result := make([]PublicItem, 0, len(items))
 	for _, item := range items {
 		result = append(result, publicItem(item))
+	}
+	return result
+}
+
+func marketItems(items []storedItem) []PublicItem {
+	result := make([]PublicItem, 0, len(items))
+	for _, item := range items {
+		result = append(result, marketItem(item))
 	}
 	return result
 }

@@ -74,6 +74,9 @@ func validatePublishRequest(req *PublishRequest) error {
 	if req.Dependencies == nil {
 		req.Dependencies = []MarketDependency{}
 	}
+	if err := normalizeSkillProfile(req); err != nil {
+		return err
+	}
 	if err := normalizeDependencies(req.Type, req.Dependencies); err != nil {
 		return err
 	}
@@ -135,6 +138,94 @@ func normalizePublishPlatform(req *PublishRequest) error {
 	return nil
 }
 
+func defaultSkillProfile() *SkillProfileSpec {
+	return &SkillProfileSpec{
+		Kind:     SkillKindSingle,
+		Category: "other",
+		Scenario: "productivity",
+		Level:    "beginner",
+	}
+}
+
+func normalizeSkillProfile(req *PublishRequest) error {
+	if req.Type != TypeSkill {
+		req.Skill = nil
+		return nil
+	}
+	if req.Skill == nil {
+		req.Skill = defaultSkillProfile()
+	}
+	req.Skill.Kind = normalizeEnum(req.Skill.Kind, SkillKindSingle, map[string]struct{}{
+		SkillKindSingle:  {},
+		SkillKindPackage: {},
+	})
+	req.Skill.Category = normalizeEnum(req.Skill.Category, "other", map[string]struct{}{
+		"document":    {},
+		"data":        {},
+		"coding":      {},
+		"browser":     {},
+		"office":      {},
+		"content":     {},
+		"media":       {},
+		"search":      {},
+		"system":      {},
+		"integration": {},
+		"automation":  {},
+		"other":       {},
+	})
+	req.Skill.Scenario = normalizeEnum(req.Skill.Scenario, "productivity", map[string]struct{}{
+		"productivity": {},
+		"developer":    {},
+		"research":     {},
+		"enterprise":   {},
+		"education":    {},
+		"creator":      {},
+	})
+	req.Skill.Level = normalizeEnum(req.Skill.Level, "beginner", map[string]struct{}{
+		"beginner":     {},
+		"intermediate": {},
+		"advanced":     {},
+	})
+	if req.Skill.Kind == SkillKindPackage {
+		req.Skill.PackageMode = SkillPackageModeCollection
+		seen := map[string]struct{}{}
+		included := make([]SkillPackageItem, 0, len(req.Skill.IncludedSkills))
+		for index, item := range req.Skill.IncludedSkills {
+			item.ID = sanitizeSlug(item.ID)
+			if item.ID == "" {
+				continue
+			}
+			if item.ID == req.ID {
+				return errors.New("skill package cannot include itself")
+			}
+			if _, ok := seen[item.ID]; ok {
+				continue
+			}
+			seen[item.ID] = struct{}{}
+			if item.SortOrder <= 0 {
+				item.SortOrder = index + 1
+			}
+			included = append(included, item)
+		}
+		req.Skill.IncludedSkills = included
+		if len(req.Skill.IncludedSkills) == 0 {
+			return errors.New("skill package requires at least one included skill")
+		}
+	} else {
+		req.Skill.PackageMode = ""
+		req.Skill.IncludedSkills = nil
+	}
+	return nil
+}
+
+func normalizeEnum(value, fallback string, allowed map[string]struct{}) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if _, ok := allowed[value]; ok {
+		return value
+	}
+	return fallback
+}
+
 func saveAndValidateArtifact(root, publicBaseURL string, req PublishRequest, file multipart.File, header *multipart.FileHeader) (*storedArtifact, error) {
 	if file == nil || header == nil {
 		return nil, nil
@@ -186,6 +277,41 @@ func saveAndValidateArtifact(root, publicBaseURL string, req PublishRequest, fil
 	}, nil
 }
 
+func saveMarketImage(root, publicBaseURL string, req PublishRequest, file multipart.File, header *multipart.FileHeader) (string, error) {
+	if header == nil {
+		return "", errors.New("image file is required")
+	}
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".webp", ".gif":
+	default:
+		return "", fmt.Errorf("unsupported image type %q", ext)
+	}
+	version := canonicalVersion(req.Version)
+	if version == "" {
+		version = "1.0.0"
+	}
+	relative := filepath.Join("media", string(req.Type), req.ID, version, "icon"+ext)
+	target := filepath.Join(root, relative)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return "", err
+	}
+	out, err := os.Create(target)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+	written, err := io.Copy(out, io.LimitReader(file, 5*1024*1024+1))
+	if err != nil {
+		return "", err
+	}
+	if written > 5*1024*1024 {
+		return "", errors.New("image exceeds 5242880 bytes")
+	}
+	base := strings.TrimRight(publicBaseURL, "/")
+	return base + "/artifacts/" + filepath.ToSlash(relative), nil
+}
+
 func validateArtifactByType(filePath string, req PublishRequest) error {
 	if err := validateArchiveTypeContract(req); err != nil {
 		return err
@@ -214,6 +340,14 @@ func validateArchiveTypeContract(req PublishRequest) error {
 			return fmt.Errorf("unsupported sandboxKind %q", req.SandboxKind)
 		}
 	}
+	if req.Type == TypeSoftwarePackage {
+		switch req.ArchiveType {
+		case "zip", "tar.gz":
+			return nil
+		default:
+			return fmt.Errorf("software-package artifact must use zip or tar.gz, got %q", req.ArchiveType)
+		}
+	}
 	if req.ArchiveType != "zip" {
 		return fmt.Errorf("%s artifact must use zip, got %q", req.Type, req.ArchiveType)
 	}
@@ -221,13 +355,14 @@ func validateArchiveTypeContract(req PublishRequest) error {
 }
 
 var artifactValidators = map[ItemType]func(string, PublishRequest) error{
-	TypeSkill:        validateSkillArtifact,
-	TypePlugin:       validatePluginArtifact,
-	TypeAgent:        validateAgentArtifact,
-	TypeSandboxImage: validateSandboxImageArtifact,
-	TypePet:          validatePetArtifact,
-	TypeCLITool:      validateCLIToolArtifact,
-	TypeWebsiteApp:   validateWebsiteAppArtifact,
+	TypeSkill:           validateSkillArtifact,
+	TypePlugin:          validatePluginArtifact,
+	TypeAgent:           validateAgentArtifact,
+	TypeSandboxImage:    validateSandboxImageArtifact,
+	TypePet:             validatePetArtifact,
+	TypeCLITool:         validateCLIToolArtifact,
+	TypeWebsiteApp:      validateWebsiteAppArtifact,
+	TypeSoftwarePackage: validateSoftwarePackageArtifact,
 }
 
 func validateSkillArtifact(filePath string, req PublishRequest) error {
@@ -383,6 +518,10 @@ func validateWebsiteAppArtifact(filePath string, req PublishRequest) error {
 	return nil
 }
 
+func validateSoftwarePackageArtifact(filePath string, req PublishRequest) error {
+	return validateSafeArchive(filePath, req.ArchiveType)
+}
+
 func validateSafeArchive(filePath, archiveType string) error {
 	_, err := archiveFileContent(filePath, archiveType, "__zenmind_missing_validation_probe__")
 	return err
@@ -390,14 +529,21 @@ func validateSafeArchive(filePath, archiveType string) error {
 
 func validateArtifactRequirement(req PublishRequest, hasArtifact bool) error {
 	required := map[ItemType]bool{
-		TypeSkill:        true,
-		TypePlugin:       true,
-		TypeAgent:        true,
-		TypeSandboxImage: true,
-		TypePet:          true,
+		TypeSkill:           true,
+		TypePlugin:          true,
+		TypeAgent:           true,
+		TypeSandboxImage:    true,
+		TypePet:             true,
+		TypeSoftwarePackage: true,
 	}
 	if req.Type == TypeWebsiteApp && req.WebsiteKind == WebsiteKindLocalApp {
 		required[TypeWebsiteApp] = true
+	}
+	if req.Type == TypeSkill && req.Skill != nil && req.Skill.Kind == SkillKindPackage {
+		if hasArtifact {
+			return errors.New("skill package links existing skills and does not accept an artifact package")
+		}
+		required[TypeSkill] = false
 	}
 	if required[req.Type] && !hasArtifact {
 		return fmt.Errorf("%s publish requires an artifact package", req.Type)
@@ -442,7 +588,7 @@ func normalizeDependencies(itemType ItemType, dependencies []MarketDependency) e
 
 func validDependencyKind(kind string) bool {
 	switch kind {
-	case DependencyBuiltinService, DependencyPlugin, DependencySkill, DependencySandboxImage, DependencyCLITool, DependencySystemCommand, DependencySystemRuntime, DependencyDesktopCapability:
+	case DependencyBuiltinService, DependencyPlugin, DependencySkill, DependencySandboxImage, DependencyCLITool, DependencySoftwarePackage, DependencySystemCommand, DependencySystemRuntime, DependencyDesktopCapability:
 		return true
 	default:
 		return false
@@ -473,6 +619,7 @@ var allowedDependencyKinds = map[ItemType][]string{
 		DependencyBuiltinService,
 		DependencySandboxImage,
 		DependencyCLITool,
+		DependencySoftwarePackage,
 		DependencySystemCommand,
 		DependencySystemRuntime,
 		DependencyDesktopCapability,
@@ -481,6 +628,7 @@ var allowedDependencyKinds = map[ItemType][]string{
 		DependencyBuiltinService,
 		DependencyPlugin,
 		DependencyCLITool,
+		DependencySoftwarePackage,
 		DependencySystemCommand,
 		DependencySystemRuntime,
 		DependencyDesktopCapability,
@@ -491,6 +639,7 @@ var allowedDependencyKinds = map[ItemType][]string{
 		DependencySkill,
 		DependencySandboxImage,
 		DependencyCLITool,
+		DependencySoftwarePackage,
 		DependencySystemCommand,
 		DependencySystemRuntime,
 		DependencyDesktopCapability,
@@ -508,6 +657,7 @@ var allowedDependencyKinds = map[ItemType][]string{
 	TypeCLITool: {
 		DependencyBuiltinService,
 		DependencyCLITool,
+		DependencySoftwarePackage,
 		DependencySystemCommand,
 		DependencySystemRuntime,
 		DependencyDesktopCapability,
@@ -516,6 +666,14 @@ var allowedDependencyKinds = map[ItemType][]string{
 		DependencyBuiltinService,
 		DependencyPlugin,
 		DependencyCLITool,
+		DependencySoftwarePackage,
+		DependencySystemCommand,
+		DependencySystemRuntime,
+		DependencyDesktopCapability,
+	},
+	TypeSoftwarePackage: {
+		DependencyBuiltinService,
+		DependencySoftwarePackage,
 		DependencySystemCommand,
 		DependencySystemRuntime,
 		DependencyDesktopCapability,

@@ -22,6 +22,8 @@ func npmPackageName(itemType ItemType, id string) string {
 		return "@zenmind-cli/" + id
 	case TypeWebsiteApp:
 		return "@zenmind-website-app/" + id
+	case TypeSoftwarePackage:
+		return "@zenmind-software-package/" + id
 	default:
 		return "@zenmind/" + id
 	}
@@ -49,6 +51,8 @@ func parseNpmPackageName(name string) (ItemType, string, error) {
 		return TypeCLITool, id, nil
 	case "@zenmind-website-app":
 		return TypeWebsiteApp, id, nil
+	case "@zenmind-software-package":
+		return TypeSoftwarePackage, id, nil
 	default:
 		return "", "", fmt.Errorf("unsupported package scope %q", parts[0])
 	}

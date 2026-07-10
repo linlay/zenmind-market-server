@@ -1,8 +1,10 @@
 package market
 
 import (
+	"archive/zip"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -48,9 +51,13 @@ func (a *App) Close() error {
 func (a *App) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.handleHealth)
+	mux.HandleFunc("POST /api/v1/auth/login", a.handleLocalLogin)
+	mux.HandleFunc("GET /api/v1/auth/me", a.handleAuthMe)
 	mux.HandleFunc("GET /api/v1/markets", a.handleMarkets)
 	mux.HandleFunc("GET /api/v1/catalog", a.handleCatalog)
 	mux.HandleFunc("GET /api/v1/desktop/catalog", a.handleDesktopCatalog)
+	mux.HandleFunc("GET /api/v1/creator/items", a.handleCreatorItems)
+	mux.HandleFunc("POST /api/v1/creator/publish", a.handleCreatorPublish)
 	mux.HandleFunc("GET /api/v1/items/{type}/{id}", a.handleItem)
 	mux.HandleFunc("GET /api/v1/adp/{type}/{id}", a.handleADPManifest)
 	for _, route := range marketRouteDefinitions() {
@@ -70,6 +77,9 @@ func (a *App) Routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}/download", func(w http.ResponseWriter, r *http.Request) {
 			a.handleMarketDownload(w, r, route.Type)
 		})
+		if route.Type == TypeSkill {
+			mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}/package/download", a.handleSkillPackageDownload)
+		}
 		mux.HandleFunc("POST /api/v1/"+route.Path+"/{id}/favorite", func(w http.ResponseWriter, r *http.Request) {
 			a.handleMarketFavorite(w, r, route.Type, true)
 		})
@@ -81,6 +91,8 @@ func (a *App) Routes() http.Handler {
 		}))
 	}
 	mux.HandleFunc("POST /api/v1/admin/publish", a.requireAdmin(a.handlePublish))
+	mux.HandleFunc("GET /api/v1/admin/reviews", a.requireAdmin(a.handleAdminReviews))
+	mux.HandleFunc("POST /api/v1/admin/reviews/{type}/{id}", a.requireAdmin(a.handleAdminReviewUpdate))
 	mux.HandleFunc("POST /api/v1/admin/unpublish", a.requireAdmin(a.handleUnpublish))
 	mux.HandleFunc("/npm/", a.handleNPM)
 	mux.HandleFunc("/artifacts/", a.handleArtifacts)
@@ -93,6 +105,49 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (a *App) handleMarkets(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, MarketsResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC(), Markets: marketInfos()})
+}
+
+func (a *App) handleLocalLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UserID string `json:"userId"`
+		Name   string `json:"name"`
+		Role   string `json:"role"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1024*1024)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	userID := sanitizeSlug(req.UserID)
+	if userID == "" {
+		userID = "local-creator"
+	}
+	role := normalizeLocalRole(req.Role)
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = userID
+	}
+	user := localUser{ID: userID, Name: name, Role: role}
+	writeJSON(w, http.StatusOK, map[string]any{"token": encodeLocalUserToken(user), "user": user})
+}
+
+func (a *App) handleAuthMe(w http.ResponseWriter, r *http.Request) {
+	if user, ok := a.localUserFromRequest(r); ok {
+		writeJSON(w, http.StatusOK, map[string]any{"user": user})
+		return
+	}
+	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
+		userID := strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
+		if userID != "" {
+			role := normalizeLocalRole(r.Header.Get("X-ZenMind-User-Role"))
+			writeJSON(w, http.StatusOK, map[string]any{"user": localUser{ID: userID, Name: userID, Role: role}})
+			return
+		}
+	}
+	if principal, ok := a.ssoJWT.principalFromRequest(r); ok && principal.HasScope("market") {
+		writeJSON(w, http.StatusOK, map[string]any{"user": localUser{ID: principal.UserID, Name: principal.UserID, Role: normalizeLocalRole(principal.Role)}})
+		return
+	}
+	writeError(w, http.StatusUnauthorized, "unauthorized", "login required")
 }
 
 func (a *App) handleCatalog(w http.ResponseWriter, r *http.Request) {
@@ -110,7 +165,7 @@ func (a *App) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	result := publicItems(items)
+	result := marketItems(items)
 	sortPublicItems(result)
 	writeJSON(w, http.StatusOK, CatalogResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC(), Items: result})
 }
@@ -123,7 +178,7 @@ func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
 	}
 	response := DesktopCatalogResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC()}
 	for _, item := range items {
-		public := publicItem(item)
+		public := marketItem(item)
 		response.Items = append(response.Items, DesktopCatalogItem{
 			ID:                public.ID,
 			Type:              public.Type,
@@ -143,7 +198,12 @@ func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
 			Install:           public.Install,
 			Uninstall:         public.Uninstall,
 			Detect:            public.Detect,
+			Skill:             public.Skill,
 			ADPInstallURL:     public.ADPInstallURL,
+			ReviewStatus:      public.ReviewStatus,
+			ReviewNote:        public.ReviewNote,
+			ReviewedAt:        public.ReviewedAt,
+			ReviewedBy:        public.ReviewedBy,
 			CreatedAt:         public.CreatedAt,
 			PublishedAt:       public.PublishedAt,
 			UpdatedAt:         public.UpdatedAt,
@@ -153,6 +213,78 @@ func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (a *App) handleCreatorItems(w http.ResponseWriter, r *http.Request) {
+	userID, ok := a.authorizedMarketUser(w, r)
+	if !ok {
+		return
+	}
+	items, err := a.store.ListCreator(r.Context(), userID, a.viewerUserID(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	result := publicItems(items)
+	sortPublicItems(result)
+	writeJSON(w, http.StatusOK, CatalogResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC(), Items: result})
+}
+
+func (a *App) handleAdminReviews(w http.ResponseWriter, r *http.Request) {
+	var itemType ItemType
+	if rawType := strings.TrimSpace(r.URL.Query().Get("type")); rawType != "" {
+		normalized, err := normalizeItemType(rawType)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
+			return
+		}
+		itemType = normalized
+	}
+	status := normalizeReviewStatus(r.URL.Query().Get("status"), "")
+	items, err := a.store.ListAdmin(r.Context(), itemType, status, a.viewerUserID(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	result := publicItems(items)
+	sortPublicItems(result)
+	writeJSON(w, http.StatusOK, CatalogResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC(), Items: result})
+}
+
+func (a *App) handleAdminReviewUpdate(w http.ResponseWriter, r *http.Request) {
+	itemType, err := normalizeItemType(r.PathValue("type"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
+		return
+	}
+	id := sanitizeSlug(r.PathValue("id"))
+	var req struct {
+		Status string `json:"status"`
+		Note   string `json:"note"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1024*1024)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if err := a.store.UpdateReview(r.Context(), itemType, id, req.Status, req.Note, a.reviewerID(r)); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_review", err.Error())
+		return
+	}
+	item, err := a.store.ListAdmin(r.Context(), itemType, "", a.viewerUserID(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	for _, candidate := range item {
+		if candidate.ID == id {
+			writeJSON(w, http.StatusOK, publicItem(candidate))
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "not_found", "market item not found")
 }
 
 func (a *App) handleItem(w http.ResponseWriter, r *http.Request) {
@@ -170,7 +302,7 @@ func (a *App) handleItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, publicItem(item))
+	writeJSON(w, http.StatusOK, marketItem(item))
 }
 
 func (a *App) handleMarketList(w http.ResponseWriter, r *http.Request, itemType ItemType) {
@@ -184,7 +316,7 @@ func (a *App) handleMarketList(w http.ResponseWriter, r *http.Request, itemType 
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	result := publicItems(items)
+	result := marketItems(items)
 	sortPublicItems(result)
 	total := len(result)
 	start, end := pageWindow(page, limit, total)
@@ -207,7 +339,7 @@ func (a *App) handleMarketItem(w http.ResponseWriter, r *http.Request, itemType 
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, publicItem(item))
+	writeJSON(w, http.StatusOK, marketItem(item))
 }
 
 func (a *App) handleMarketVersions(w http.ResponseWriter, r *http.Request, itemType ItemType) {
@@ -226,7 +358,7 @@ func (a *App) handleMarketVersions(w http.ResponseWriter, r *http.Request, itemT
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, VersionsResponse{SchemaVersion: 1, Item: publicItem(item), Versions: versions})
+	writeJSON(w, http.StatusOK, VersionsResponse{SchemaVersion: 1, Item: marketItem(item), Versions: versions})
 }
 
 func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemType ItemType) {
@@ -252,7 +384,7 @@ func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemTy
 	}
 	artifact, err := a.store.GetArtifact(r.Context(), itemType, id, version, platform)
 	if errors.Is(err, sql.ErrNoRows) {
-		response := ResolveResponse{SchemaVersion: 1, Item: publicItem(item), Version: version, Platform: platform}
+		response := ResolveResponse{SchemaVersion: 1, Item: marketItem(item), Version: version, Platform: platform}
 		if platformErr == nil {
 			response.Platform = platformSpec.Platform
 			response.PlatformSpec = &platformSpec
@@ -273,7 +405,7 @@ func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemTy
 		Platform:    artifact.PlatformKey,
 		Role:        artifact.AssetRole,
 	}
-	response := ResolveResponse{SchemaVersion: 1, Item: publicItem(item), Version: artifact.Version, Platform: artifact.PlatformKey, Asset: &asset}
+	response := ResolveResponse{SchemaVersion: 1, Item: marketItem(item), Version: artifact.Version, Platform: artifact.PlatformKey, Asset: &asset}
 	if platformErr == nil {
 		response.PlatformSpec = &platformSpec
 	}
@@ -282,6 +414,91 @@ func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemTy
 
 func (a *App) handleMarketDownload(w http.ResponseWriter, r *http.Request, itemType ItemType) {
 	a.downloadArtifact(w, r, itemType, sanitizeSlug(r.PathValue("id")), r.URL.Query().Get("version"), r.URL.Query().Get("platform"))
+}
+
+func (a *App) handleSkillPackageDownload(w http.ResponseWriter, r *http.Request) {
+	id := sanitizeSlug(r.PathValue("id"))
+	item, err := a.store.GetPublic(r.Context(), TypeSkill, id, a.viewerUserID(r))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "skill package not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	if item.Skill == nil || item.Skill.Kind != SkillKindPackage {
+		writeError(w, http.StatusBadRequest, "not_skill_package", "skill is not a package")
+		return
+	}
+	if len(item.Skill.IncludedSkills) == 0 {
+		writeError(w, http.StatusBadRequest, "empty_skill_package", "skill package has no included skills")
+		return
+	}
+	platform := strings.TrimSpace(r.URL.Query().Get("platform"))
+	filename := item.ID + "-" + item.LatestVersion + ".zip"
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+	manifest := map[string]any{
+		"schemaVersion": 1,
+		"type":          "skill-package",
+		"id":            item.ID,
+		"name":          item.Name,
+		"version":       item.LatestVersion,
+		"generatedAt":   time.Now().UTC(),
+		"skills":        []map[string]any{},
+	}
+	manifestSkills := manifest["skills"].([]map[string]any)
+	for _, included := range item.Skill.IncludedSkills {
+		skill, err := a.store.GetPublic(r.Context(), TypeSkill, included.ID, a.viewerUserID(r))
+		if errors.Is(err, sql.ErrNoRows) {
+			writeZipError(zw, "errors/"+included.ID+".txt", "included skill not found: "+included.ID+"\n")
+			continue
+		}
+		if err != nil {
+			writeZipError(zw, "errors/"+included.ID+".txt", err.Error()+"\n")
+			continue
+		}
+		artifact, err := a.store.GetArtifact(r.Context(), TypeSkill, included.ID, "", platform)
+		if err != nil {
+			writeZipError(zw, "errors/"+included.ID+".txt", "artifact not found: "+included.ID+"\n")
+			continue
+		}
+		skillPath := "skills/" + included.ID + "/"
+		if artifact.ArchiveType != "zip" {
+			writeZipError(zw, "errors/"+included.ID+".txt", "skill package can only expand zip artifacts: "+included.ID+"\n")
+			continue
+		}
+		if err := writeExtractedZipFromPath(zw, skillPath, artifact.Path); err != nil {
+			writeZipError(zw, "errors/"+included.ID+".txt", err.Error()+"\n")
+			continue
+		}
+		adpYAML, err := a.store.GetADPYAML(r.Context(), TypeSkill, included.ID, artifact.Version)
+		if err == nil {
+			if err := writeZipText(zw, "adp/"+included.ID+".adp.yaml", adpYAML); err != nil {
+				writeZipError(zw, "errors/"+included.ID+"-adp.txt", err.Error()+"\n")
+			}
+		}
+		a.store.RecordDownload(r.Context(), TypeSkill, included.ID, artifact.Version, artifact.PlatformKey, r.UserAgent(), requestIP(r))
+		manifestSkills = append(manifestSkills, map[string]any{
+			"id":        skill.ID,
+			"name":      skill.Name,
+			"version":   skill.LatestVersion,
+			"path":      skillPath,
+			"adp":       "adp/" + included.ID + ".adp.yaml",
+			"sha256":    artifact.SHA256,
+			"platform":  artifact.PlatformKey,
+			"optional":  included.Optional,
+			"sortOrder": included.SortOrder,
+		})
+	}
+	manifest["skills"] = manifestSkills
+	manifestFile, err := zw.Create("manifest.json")
+	if err == nil {
+		_ = json.NewEncoder(manifestFile).Encode(manifest)
+	}
 }
 
 func (a *App) handleMarketFavorite(w http.ResponseWriter, r *http.Request, itemType ItemType, favorite bool) {
@@ -313,7 +530,7 @@ func (a *App) handleMarketFavorite(w http.ResponseWriter, r *http.Request, itemT
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, publicItem(item))
+	writeJSON(w, http.StatusOK, marketItem(item))
 }
 
 func (a *App) handlePublish(w http.ResponseWriter, r *http.Request) {
@@ -325,6 +542,18 @@ func (a *App) handleTypedPublish(w http.ResponseWriter, r *http.Request, itemTyp
 }
 
 func (a *App) handlePublishWithType(w http.ResponseWriter, r *http.Request, forcedType ItemType) {
+	a.handlePublishWithOptions(w, r, forcedType, "", "")
+}
+
+func (a *App) handleCreatorPublish(w http.ResponseWriter, r *http.Request) {
+	userID, ok := a.authorizedMarketUser(w, r)
+	if !ok {
+		return
+	}
+	a.handlePublishWithOptions(w, r, "", ReviewStatusPending, userID)
+}
+
+func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, forcedType ItemType, forcedReviewStatus string, creatorID string) {
 	var req PublishRequest
 	var artifact *storedArtifact
 	contentType := r.Header.Get("content-type")
@@ -350,6 +579,23 @@ func (a *App) handlePublishWithType(w http.ResponseWriter, r *http.Request, forc
 		}
 		if err := validatePublishRequest(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
+			return
+		}
+		imageFile, imageHeader, imageErr := r.FormFile("image")
+		if imageErr == nil {
+			defer imageFile.Close()
+			imageURL, err := saveMarketImage(a.cfg.ArtifactRoot, a.cfg.PublicBaseURL, req, imageFile, imageHeader)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_image", err.Error())
+				return
+			}
+			if req.Metadata == nil {
+				req.Metadata = map[string]string{}
+			}
+			req.Metadata["icon"] = imageURL
+			req.Metadata["screenshot"] = imageURL
+		} else if !errors.Is(imageErr, http.ErrMissingFile) {
+			writeError(w, http.StatusBadRequest, "invalid_image", imageErr.Error())
 			return
 		}
 		file, header, err := r.FormFile("artifact")
@@ -382,6 +628,12 @@ func (a *App) handlePublishWithType(w http.ResponseWriter, r *http.Request, forc
 	if err := validateArchiveTypeContract(req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_artifact", err.Error())
 		return
+	}
+	if forcedReviewStatus != "" {
+		req.ReviewStatus = forcedReviewStatus
+	}
+	if creatorID != "" {
+		req.CreatorID = creatorID
 	}
 	if err := normalizePublishADP(r.Context(), a.store, a.cfg.PublicBaseURL, &req, artifact); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_adp", err.Error())
@@ -511,6 +763,89 @@ func (a *App) downloadArtifact(w http.ResponseWriter, r *http.Request, itemType 
 	http.Redirect(w, r, artifact.URL, http.StatusFound)
 }
 
+func writeZipFileFromPath(zw *zip.Writer, name string, filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	entry, err := zw.Create(name)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(entry, file)
+	return err
+}
+
+func writeExtractedZipFromPath(zw *zip.Writer, prefix string, filePath string) error {
+	source, err := zip.OpenReader(filePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	prefix = strings.Trim(path.Clean(strings.TrimSpace(prefix)), "/")
+	if prefix == "." || prefix == "" {
+		return errors.New("zip prefix is required")
+	}
+	for _, file := range source.File {
+		name := strings.TrimSpace(filepath.ToSlash(file.Name))
+		cleanName := path.Clean(name)
+		if cleanName == "." || strings.HasPrefix(cleanName, "../") || path.IsAbs(cleanName) {
+			return fmt.Errorf("unsafe zip entry %q", file.Name)
+		}
+		targetName := prefix + "/" + cleanName
+		if file.FileInfo().IsDir() {
+			if !strings.HasSuffix(targetName, "/") {
+				targetName += "/"
+			}
+			header := &zip.FileHeader{
+				Name:     targetName,
+				Method:   zip.Store,
+				Modified: file.Modified,
+			}
+			if _, err := zw.CreateHeader(header); err != nil {
+				return err
+			}
+			continue
+		}
+		reader, err := file.Open()
+		if err != nil {
+			return err
+		}
+		header := &zip.FileHeader{
+			Name:     targetName,
+			Method:   zip.Deflate,
+			Modified: file.Modified,
+		}
+		writer, err := zw.CreateHeader(header)
+		if err != nil {
+			reader.Close()
+			return err
+		}
+		if _, err := io.Copy(writer, reader); err != nil {
+			reader.Close()
+			return err
+		}
+		if err := reader.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeZipText(zw *zip.Writer, name string, text string) error {
+	entry, err := zw.Create(name)
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(entry, text)
+	return err
+}
+
+func writeZipError(zw *zip.Writer, name string, text string) {
+	_ = writeZipText(zw, name, text)
+}
+
 func (a *App) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		result := a.authorizedAdmin(r)
@@ -529,6 +864,12 @@ type authResult struct {
 	Message string
 }
 
+type localUser struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
 func allowAuth() authResult {
 	return authResult{OK: true}
 }
@@ -541,6 +882,12 @@ func (a *App) authorizedAdmin(r *http.Request) authResult {
 	auth := strings.TrimSpace(r.Header.Get("authorization"))
 	if a.cfg.AdminToken != "" && strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(auth, "Bearer")), a.cfg.AdminToken) {
 		return allowAuth()
+	}
+	if user, ok := a.localUserFromRequest(r); ok {
+		if user.Role == "admin" {
+			return allowAuth()
+		}
+		return denyAuth(http.StatusForbidden, "forbidden", "admin role required")
 	}
 	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
 		role := strings.ToLower(strings.TrimSpace(r.Header.Get("X-ZenMind-User-Role")))
@@ -568,6 +915,9 @@ func (a *App) authorizedAdmin(r *http.Request) authResult {
 }
 
 func (a *App) viewerUserID(r *http.Request) string {
+	if user, ok := a.localUserFromRequest(r); ok {
+		return user.ID
+	}
 	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
 		return strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
 	}
@@ -577,7 +927,26 @@ func (a *App) viewerUserID(r *http.Request) string {
 	return ""
 }
 
+func (a *App) reviewerID(r *http.Request) string {
+	if user, ok := a.localUserFromRequest(r); ok {
+		return user.ID
+	}
+	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
+		userID := strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
+		if userID != "" {
+			return userID
+		}
+	}
+	if principal, ok := a.ssoJWT.principalFromRequest(r); ok && principal.HasScope("market") {
+		return principal.UserID
+	}
+	return "admin"
+}
+
 func (a *App) authorizedMarketUser(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if user, ok := a.localUserFromRequest(r); ok {
+		return user.ID, true
+	}
 	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
 		userID := strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
 		if userID != "" {
@@ -602,6 +971,48 @@ func (a *App) authorizedMarketUser(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principal.UserID, true
+}
+
+func (a *App) localUserFromRequest(r *http.Request) (localUser, bool) {
+	return decodeLocalUserToken(bearerToken(r.Header.Get("Authorization")))
+}
+
+func encodeLocalUserToken(user localUser) string {
+	raw, _ := json.Marshal(user)
+	return "local." + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeLocalUserToken(token string) (localUser, bool) {
+	if !strings.HasPrefix(token, "local.") {
+		return localUser{}, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(token, "local."))
+	if err != nil {
+		return localUser{}, false
+	}
+	var user localUser
+	if err := json.Unmarshal(raw, &user); err != nil {
+		return localUser{}, false
+	}
+	user.ID = strings.TrimSpace(user.ID)
+	user.Role = normalizeLocalRole(user.Role)
+	user.Name = strings.TrimSpace(user.Name)
+	if user.ID == "" {
+		return localUser{}, false
+	}
+	if user.Name == "" {
+		user.Name = user.ID
+	}
+	return user, true
+}
+
+func normalizeLocalRole(role string) string {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "admin", "administrator":
+		return "admin"
+	default:
+		return "creator"
+	}
 }
 
 func jwtAuthError(err error) authResult {
@@ -678,27 +1089,30 @@ func marketRouteDefinitions() []marketRoute {
 		{Type: TypeCLITool, Path: "cli-tools", IncludeInInfo: true},
 		{Type: TypeWebsiteApp, Path: "webapps", IncludeInInfo: true},
 		{Type: TypeWebsiteApp, Path: "website-apps"},
+		{Type: TypeSoftwarePackage, Path: "software-packages", IncludeInInfo: true},
 	}
 }
 
 func marketInfos() []MarketInfo {
 	archiveTypes := map[ItemType][]string{
-		TypeSkill:        {"zip"},
-		TypePlugin:       {"zip"},
-		TypeAgent:        {"zip"},
-		TypeSandboxImage: {"zip", "tar.gz"},
-		TypePet:          {"zip"},
-		TypeCLITool:      {"zip"},
-		TypeWebsiteApp:   {"zip"},
+		TypeSkill:           {"zip"},
+		TypePlugin:          {"zip"},
+		TypeAgent:           {"zip"},
+		TypeSandboxImage:    {"zip", "tar.gz"},
+		TypePet:             {"zip"},
+		TypeCLITool:         {"zip"},
+		TypeWebsiteApp:      {"zip"},
+		TypeSoftwarePackage: {"zip", "tar.gz"},
 	}
 	names := map[ItemType]string{
-		TypeSkill:        "Skill Market",
-		TypePlugin:       "Plugin Market",
-		TypeAgent:        "Agents Market",
-		TypeSandboxImage: "Sandbox Image Market",
-		TypePet:          "Pet Market",
-		TypeCLITool:      "CLI Tool Market",
-		TypeWebsiteApp:   "WebApps Market",
+		TypeSkill:           "Skill Market",
+		TypePlugin:          "Plugin Market",
+		TypeAgent:           "Agents Market",
+		TypeSandboxImage:    "Sandbox Image Market",
+		TypePet:             "Pet Market",
+		TypeCLITool:         "CLI Tool Market",
+		TypeWebsiteApp:      "WebApps Market",
+		TypeSoftwarePackage: "Software Package Market",
 	}
 	routes := marketRouteDefinitions()
 	result := make([]MarketInfo, 0, len(routes))

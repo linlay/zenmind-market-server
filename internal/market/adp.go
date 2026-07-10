@@ -78,6 +78,10 @@ func normalizePublishADP(ctx context.Context, store *Store, publicBaseURL string
 		req.ADPYAML = ""
 		return nil
 	}
+	if req.Type == TypeSkill && req.Skill != nil && req.Skill.Kind == SkillKindPackage {
+		req.ADPYAML = ""
+		return nil
+	}
 	if strings.TrimSpace(req.ADPYAML) == "" {
 		return fmt.Errorf("%s publish requires adp.yaml", req.Type)
 	}

@@ -19,21 +19,29 @@ type Config struct {
 type ItemType string
 
 const (
-	TypeSkill        ItemType = "skill"
-	TypePlugin       ItemType = "plugin"
-	TypeAgent        ItemType = "agent"
-	TypeSandboxImage ItemType = "sandbox-image"
-	TypePet          ItemType = "pet"
-	TypeCLITool      ItemType = "cli-tool"
-	TypeWebsiteApp   ItemType = "website-app"
+	TypeSkill           ItemType = "skill"
+	TypePlugin          ItemType = "plugin"
+	TypeAgent           ItemType = "agent"
+	TypeSandboxImage    ItemType = "sandbox-image"
+	TypePet             ItemType = "pet"
+	TypeCLITool         ItemType = "cli-tool"
+	TypeWebsiteApp      ItemType = "website-app"
+	TypeSoftwarePackage ItemType = "software-package"
 )
 
 const (
+	SkillKindSingle             = "single"
+	SkillKindPackage            = "package"
+	SkillPackageModeCollection  = "collection"
+	ReviewStatusPending         = "pending"
+	ReviewStatusApproved        = "approved"
+	ReviewStatusRejected        = "rejected"
 	DependencyBuiltinService    = "builtin-service"
 	DependencyPlugin            = "plugin"
 	DependencySkill             = "skill"
 	DependencySandboxImage      = "sandbox-image"
 	DependencyCLITool           = "cli-tool"
+	DependencySoftwarePackage   = "software-package"
 	DependencySystemCommand     = "system-command"
 	DependencySystemRuntime     = "system-runtime"
 	DependencyDesktopCapability = "desktop-capability"
@@ -68,7 +76,43 @@ type PublishRequest struct {
 	Uninstall         *MarketScriptSpec   `json:"uninstall"`
 	Detect            *MarketDetectSpec   `json:"detect"`
 	Platform          *MarketPlatformSpec `json:"platform"`
+	Skill             *SkillProfileSpec   `json:"skill"`
 	ADPYAML           string              `json:"adpYaml"`
+	ReviewStatus      string              `json:"reviewStatus,omitempty"`
+	CreatorID         string              `json:"-"`
+}
+
+type SkillProfileSpec struct {
+	Kind           string             `json:"kind,omitempty"`
+	Category       string             `json:"category,omitempty"`
+	Scenario       string             `json:"scenario,omitempty"`
+	Level          string             `json:"level,omitempty"`
+	PackageMode    string             `json:"packageMode,omitempty"`
+	Featured       bool               `json:"featured,omitempty"`
+	IncludedSkills []SkillPackageItem `json:"includedSkills,omitempty"`
+}
+
+type SkillPackageItem struct {
+	ID        string `json:"id"`
+	Optional  bool   `json:"optional,omitempty"`
+	SortOrder int    `json:"sortOrder,omitempty"`
+}
+
+type PublicSkillPackageItem struct {
+	ID        string `json:"id"`
+	Name      string `json:"name,omitempty"`
+	Optional  bool   `json:"optional,omitempty"`
+	SortOrder int    `json:"sortOrder,omitempty"`
+}
+
+type PublicSkillProfile struct {
+	Kind           string                   `json:"kind"`
+	Category       string                   `json:"category"`
+	Scenario       string                   `json:"scenario,omitempty"`
+	Level          string                   `json:"level,omitempty"`
+	PackageMode    string                   `json:"packageMode,omitempty"`
+	Featured       bool                     `json:"featured,omitempty"`
+	IncludedSkills []PublicSkillPackageItem `json:"includedSkills,omitempty"`
 }
 
 type PublicAsset struct {
@@ -156,7 +200,12 @@ type PublicItem struct {
 	Install           *MarketScriptSpec         `json:"install,omitempty"`
 	Uninstall         *MarketScriptSpec         `json:"uninstall,omitempty"`
 	Detect            *MarketDetectSpec         `json:"detect,omitempty"`
+	Skill             *PublicSkillProfile       `json:"skill,omitempty"`
 	ADPInstallURL     string                    `json:"adpInstallUrl,omitempty"`
+	ReviewStatus      string                    `json:"reviewStatus,omitempty"`
+	ReviewNote        string                    `json:"reviewNote,omitempty"`
+	ReviewedAt        *time.Time                `json:"reviewedAt,omitempty"`
+	ReviewedBy        string                    `json:"reviewedBy,omitempty"`
 	CreatedAt         time.Time                 `json:"createdAt"`
 	PublishedAt       time.Time                 `json:"publishedAt"`
 	UpdatedAt         time.Time                 `json:"updatedAt"`
@@ -220,7 +269,12 @@ type DesktopCatalogItem struct {
 	Install           *MarketScriptSpec         `json:"install,omitempty"`
 	Uninstall         *MarketScriptSpec         `json:"uninstall,omitempty"`
 	Detect            *MarketDetectSpec         `json:"detect,omitempty"`
+	Skill             *PublicSkillProfile       `json:"skill,omitempty"`
 	ADPInstallURL     string                    `json:"adpInstallUrl,omitempty"`
+	ReviewStatus      string                    `json:"reviewStatus,omitempty"`
+	ReviewNote        string                    `json:"reviewNote,omitempty"`
+	ReviewedAt        *time.Time                `json:"reviewedAt,omitempty"`
+	ReviewedBy        string                    `json:"reviewedBy,omitempty"`
 	CreatedAt         time.Time                 `json:"createdAt"`
 	PublishedAt       time.Time                 `json:"publishedAt"`
 	UpdatedAt         time.Time                 `json:"updatedAt"`
@@ -271,6 +325,7 @@ type storedItem struct {
 	MinDesktopVersion string
 	SandboxKind       string
 	WebsiteKind       string
+	CreatorID         string
 	Published         bool
 	PublishedAt       time.Time
 	UpdatedAt         time.Time
@@ -282,7 +337,12 @@ type storedItem struct {
 	Install           *MarketScriptSpec
 	Uninstall         *MarketScriptSpec
 	Detect            *MarketDetectSpec
+	Skill             *PublicSkillProfile
 	ADPYAML           string
+	ReviewStatus      string
+	ReviewNote        string
+	ReviewedAt        time.Time
+	ReviewedBy        string
 	DownloadCount     int
 	FavoriteCount     int
 	Favorited         bool
