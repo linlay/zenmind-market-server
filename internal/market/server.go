@@ -20,16 +20,18 @@ import (
 )
 
 type App struct {
-	cfg    Config
-	store  *Store
-	ssoJWT *ssoJWTVerifier
+	cfg             Config
+	store           *Store
+	artifactStorage artifactStorage
+	ssoJWT          *ssoJWTVerifier
 }
 
 func Open(ctx context.Context, cfg Config) (*App, error) {
 	if cfg.MaxUploadBytes <= 0 {
 		cfg.MaxUploadBytes = 512 * 1024 * 1024
 	}
-	if err := os.MkdirAll(cfg.ArtifactRoot, 0o755); err != nil {
+	storage, err := newArtifactStorage(cfg)
+	if err != nil {
 		return nil, err
 	}
 	store, err := OpenStore(ctx, cfg.DatabasePath)
@@ -41,7 +43,7 @@ func Open(ctx context.Context, cfg Config) (*App, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	return &App{cfg: cfg, store: store, ssoJWT: ssoJWT}, nil
+	return &App{cfg: cfg, store: store, artifactStorage: storage, ssoJWT: ssoJWT}, nil
 }
 
 func (a *App) Close() error {
@@ -591,7 +593,7 @@ func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, f
 		imageFile, imageHeader, imageErr := r.FormFile("image")
 		if imageErr == nil {
 			defer imageFile.Close()
-			imageURL, err := saveMarketImage(a.cfg.ArtifactRoot, a.cfg.PublicBaseURL, req, imageFile, imageHeader)
+			imageURL, err := saveMarketImage(r.Context(), a.artifactStorage, a.cfg.PublicBaseURL, req, imageFile, imageHeader)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, "invalid_image", err.Error())
 				return
@@ -608,7 +610,7 @@ func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, f
 		file, header, err := r.FormFile("artifact")
 		if err == nil {
 			defer file.Close()
-			artifact, err = saveAndValidateArtifact(a.cfg.ArtifactRoot, a.cfg.PublicBaseURL, req, file, header)
+			artifact, err = saveAndValidateArtifact(r.Context(), a.artifactStorage, a.cfg.PublicBaseURL, req, file, header)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, "invalid_artifact", err.Error())
 				return
@@ -749,25 +751,30 @@ func (a *App) handleNPM(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 	relative := strings.TrimPrefix(r.URL.Path, "/artifacts/")
-	if relative == "" || strings.Contains(relative, "..") {
+	objectID, err := a.artifactStorage.ObjectID(relative)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_path", "invalid artifact path")
 		return
 	}
-	fullPath := filepath.Join(a.cfg.ArtifactRoot, filepath.FromSlash(relative))
-	root, _ := filepath.Abs(a.cfg.ArtifactRoot)
-	resolved, _ := filepath.Abs(fullPath)
-	if !strings.HasPrefix(resolved, root+string(filepath.Separator)) {
-		writeError(w, http.StatusBadRequest, "invalid_path", "invalid artifact path")
+	if !strings.HasPrefix(relative, "media/") {
+		if err := a.store.EnsurePublishedArtifactPath(r.Context(), objectID); errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not_found", "artifact not found")
+			return
+		} else if err != nil {
+			writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+			return
+		}
+	}
+	if localPath, ok := a.artifactStorage.LocalPath(objectID); ok {
+		http.ServeFile(w, r, localPath)
 		return
 	}
-	if err := a.store.EnsurePublishedArtifactPath(r.Context(), resolved); errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound, "not_found", "artifact not found")
-		return
-	} else if err != nil {
-		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+	downloadURL, err := a.artifactStorage.PresignGet(r.Context(), objectID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error())
 		return
 	}
-	http.ServeFile(w, r, resolved)
+	http.Redirect(w, r, downloadURL, http.StatusFound)
 }
 
 func (a *App) downloadArtifact(w http.ResponseWriter, r *http.Request, itemType ItemType, id, version, platform string) {

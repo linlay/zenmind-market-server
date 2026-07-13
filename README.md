@@ -28,7 +28,7 @@ The server is the source of truth for market data. The website should read `/api
 
 CLI tools and skills require an ADP `schema: "0.1"` manifest at publish time. The server validates the latest hook protocol (`exec`, `sh`, `pwsh`, `cmd` runners), rejects legacy hook syntax, and binds uploaded artifact URLs plus SHA-256 values into the stored `adp.yaml`.
 
-In container deployments, keep SQLite and artifacts in the same persistent backend volume:
+In local-storage container deployments, keep SQLite and artifacts in the same persistent backend volume:
 
 ```yaml
 environment:
@@ -41,6 +41,23 @@ volumes:
 
 Published artifact files are stored under `/data/artifacts/{type}/{id}/{version}/...`, while SQLite stores metadata, checksums, and generated artifact URLs. Configure `MARKET_PUBLIC_BASE_URL` to the final public market domain before publishing, because artifact URLs are written into SQLite when an artifact is uploaded.
 
+For production object storage, set `MARKET_ARTIFACT_STORAGE=s3`. The server uploads validated artifacts to S3 (or an S3-compatible COS/MinIO endpoint), keeps only the object key and checksums in SQLite, and redirects `/artifacts/...` requests to a short-lived signed S3 URL. Keep `MARKET_PUBLIC_BASE_URL` pointed at the market API: the stable API URL is embedded in manifests while the signed S3 URL is generated at download time.
+
+```yaml
+environment:
+  MARKET_ARTIFACT_STORAGE: s3
+  MARKET_S3_BUCKET: zenmind-market-artifacts
+  MARKET_S3_REGION: ap-guangzhou
+  # COS example: bucket-specific endpoint; MinIO can use its S3 endpoint.
+  MARKET_S3_ENDPOINT: https://zenmind-market-artifacts.cos.ap-guangzhou.myqcloud.com
+  MARKET_S3_PREFIX: market
+  MARKET_S3_ACCESS_KEY_ID: ${MARKET_S3_ACCESS_KEY_ID}
+  MARKET_S3_SECRET_ACCESS_KEY: ${MARKET_S3_SECRET_ACCESS_KEY}
+  MARKET_S3_PRESIGN_TTL: 5m
+```
+
+S3 credentials are required only in S3 mode. Do not commit them; provide them through deployment secrets. Local mode remains the default, so `go test ./...` and `go run ./cmd/market-server` work without any S3 configuration.
+
 ## Environment
 
 The server loads `.env` from the current working directory before building its runtime config. Existing shell variables win over values in `.env`.
@@ -50,6 +67,15 @@ The server loads `.env` from the current working directory before building its r
 | `MARKET_ADDR` | `:8088` | HTTP listen address. |
 | `MARKET_DB_PATH` | `data/market.db` | SQLite database path. |
 | `MARKET_ARTIFACT_ROOT` | `data/artifacts` | Local artifact storage directory. |
+| `MARKET_ARTIFACT_STORAGE` | `local` | Artifact backend: `local` or `s3`. |
+| `MARKET_S3_BUCKET` | empty | Required S3 bucket in `s3` mode. |
+| `MARKET_S3_REGION` | `us-east-1` | S3 signing region. |
+| `MARKET_S3_ENDPOINT` | empty | Optional bucket-specific endpoint for COS, MinIO, or another S3-compatible service. |
+| `MARKET_S3_PREFIX` | empty | Optional prefix prepended to every stored object key. |
+| `MARKET_S3_ACCESS_KEY_ID` | empty | Required access key in `s3` mode. |
+| `MARKET_S3_SECRET_ACCESS_KEY` | empty | Required secret key in `s3` mode. |
+| `MARKET_S3_SESSION_TOKEN` | empty | Optional temporary-credential session token. |
+| `MARKET_S3_PRESIGN_TTL` | `5m` | Lifetime of signed S3 download URLs; maximum 7 days. |
 | `MARKET_PUBLIC_BASE_URL` | `http://localhost:8088` | Public base URL used when generating artifact URLs. Use `https://market.zenmind.cc` in production. |
 | `MARKET_ADMIN_TOKEN` | empty | Bearer token required for admin APIs. |
 | `MARKET_PROXY_TOKEN` | empty | Trusted proxy header token. |

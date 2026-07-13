@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"os"
 	"path/filepath"
@@ -226,7 +228,7 @@ func normalizeEnum(value, fallback string, allowed map[string]struct{}) string {
 	return fallback
 }
 
-func saveAndValidateArtifact(root, publicBaseURL string, req PublishRequest, file multipart.File, header *multipart.FileHeader) (*storedArtifact, error) {
+func saveAndValidateArtifact(ctx context.Context, storage artifactStorage, publicBaseURL string, req PublishRequest, file multipart.File, header *multipart.FileHeader) (*storedArtifact, error) {
 	if file == nil || header == nil {
 		return nil, nil
 	}
@@ -257,11 +259,11 @@ func saveAndValidateArtifact(root, publicBaseURL string, req PublishRequest, fil
 
 	extension := artifactExtension(req.ArchiveType, header.Filename)
 	relative := filepath.Join(string(req.Type), req.ID, req.Version, fmt.Sprintf("%s-%s%s", req.PlatformKey, shaHex[:12], extension))
-	target := filepath.Join(root, relative)
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	objectID, err := storage.ObjectID(filepath.ToSlash(relative))
+	if err != nil {
 		return nil, err
 	}
-	if err := copyFile(tempPath, target); err != nil {
+	if err := storage.Put(ctx, objectID, tempPath, contentTypeForFilename(header.Filename), shaHex); err != nil {
 		return nil, err
 	}
 	return &storedArtifact{
@@ -269,7 +271,7 @@ func saveAndValidateArtifact(root, publicBaseURL string, req PublishRequest, fil
 		PlatformKey: req.PlatformKey,
 		AssetRole:   req.AssetRole,
 		ArchiveType: req.ArchiveType,
-		Path:        target,
+		Path:        objectID,
 		URL:         strings.TrimRight(publicBaseURL, "/") + "/artifacts/" + filepath.ToSlash(relative),
 		SHA256:      shaHex,
 		Integrity:   integrity,
@@ -277,7 +279,7 @@ func saveAndValidateArtifact(root, publicBaseURL string, req PublishRequest, fil
 	}, nil
 }
 
-func saveMarketImage(root, publicBaseURL string, req PublishRequest, file multipart.File, header *multipart.FileHeader) (string, error) {
+func saveMarketImage(ctx context.Context, storage artifactStorage, publicBaseURL string, req PublishRequest, file multipart.File, header *multipart.FileHeader) (string, error) {
 	if header == nil {
 		return "", errors.New("image file is required")
 	}
@@ -292,24 +294,39 @@ func saveMarketImage(root, publicBaseURL string, req PublishRequest, file multip
 		version = "1.0.0"
 	}
 	relative := filepath.Join("media", string(req.Type), req.ID, version, "icon"+ext)
-	target := filepath.Join(root, relative)
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return "", err
-	}
-	out, err := os.Create(target)
+	temp, err := os.CreateTemp("", "zenmind-market-image-*")
 	if err != nil {
 		return "", err
 	}
-	defer out.Close()
-	written, err := io.Copy(out, io.LimitReader(file, 5*1024*1024+1))
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	hash := sha256.New()
+	written, err := io.Copy(io.MultiWriter(temp, hash), io.LimitReader(file, 5*1024*1024+1))
+	if closeErr := temp.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		return "", err
 	}
 	if written > 5*1024*1024 {
 		return "", errors.New("image exceeds 5242880 bytes")
 	}
+	objectID, err := storage.ObjectID(filepath.ToSlash(relative))
+	if err != nil {
+		return "", err
+	}
+	if err := storage.Put(ctx, objectID, tempPath, contentTypeForFilename(header.Filename), hex.EncodeToString(hash.Sum(nil))); err != nil {
+		return "", err
+	}
 	base := strings.TrimRight(publicBaseURL, "/")
 	return base + "/artifacts/" + filepath.ToSlash(relative), nil
+}
+
+func contentTypeForFilename(filename string) string {
+	if contentType := mime.TypeByExtension(strings.ToLower(filepath.Ext(filename))); contentType != "" {
+		return contentType
+	}
+	return "application/octet-stream"
 }
 
 func validateArtifactByType(filePath string, req PublishRequest) error {

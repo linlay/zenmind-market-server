@@ -19,6 +19,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,12 +56,83 @@ func newTestAppWithConfig(t *testing.T, override Config) *App {
 	if override.SSOJWTAudience != "" {
 		cfg.SSOJWTAudience = override.SSOJWTAudience
 	}
+	if override.ArtifactStorage != "" {
+		cfg.ArtifactStorage = override.ArtifactStorage
+	}
+	if override.S3Bucket != "" {
+		cfg.S3Bucket = override.S3Bucket
+	}
+	if override.S3Region != "" {
+		cfg.S3Region = override.S3Region
+	}
+	if override.S3Endpoint != "" {
+		cfg.S3Endpoint = override.S3Endpoint
+	}
 	app, err := Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
 	t.Cleanup(func() { _ = app.Close() })
 	return app
+}
+
+func TestOpenDefaultsToLocalArtifactStorage(t *testing.T) {
+	app := newTestApp(t)
+	if _, ok := app.artifactStorage.(*localArtifactStorage); !ok {
+		t.Fatalf("artifact storage = %T, want *localArtifactStorage", app.artifactStorage)
+	}
+}
+
+func TestOpenS3ArtifactStorageRequiresBucket(t *testing.T) {
+	root := t.TempDir()
+	_, err := Open(context.Background(), Config{
+		DatabasePath:    filepath.Join(root, "market.db"),
+		ArtifactRoot:    filepath.Join(root, "artifacts"),
+		ArtifactStorage: "s3",
+		PublicBaseURL:   "http://market.test",
+		MaxUploadBytes:  10 * 1024 * 1024,
+	})
+	if err == nil || !strings.Contains(err.Error(), "S3 bucket") {
+		t.Fatalf("Open() error = %v, want missing S3 bucket error", err)
+	}
+}
+
+func TestS3ArtifactStorageBuildsPrefixedPresignedDownloadURL(t *testing.T) {
+	storage, err := newS3ArtifactStorage(Config{
+		S3Bucket:          "market-artifacts",
+		S3Region:          "ap-guangzhou",
+		S3Endpoint:        "https://market-artifacts.cos.ap-guangzhou.myqcloud.com",
+		S3Prefix:          "market",
+		S3AccessKeyID:     "test-access-key",
+		S3SecretAccessKey: "test-secret-key",
+		S3PresignTTL:      time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("newS3ArtifactStorage() error = %v", err)
+	}
+	objectID, err := storage.ObjectID("skill/demo/1.0.0/universal-abc.zip")
+	if err != nil {
+		t.Fatalf("ObjectID() error = %v", err)
+	}
+	if objectID != "market/skill/demo/1.0.0/universal-abc.zip" {
+		t.Fatalf("ObjectID() = %q", objectID)
+	}
+	downloadURL, err := storage.PresignGet(context.Background(), objectID)
+	if err != nil {
+		t.Fatalf("PresignGet() error = %v", err)
+	}
+	parsed, err := url.Parse(downloadURL)
+	if err != nil {
+		t.Fatalf("parse presigned URL: %v", err)
+	}
+	if parsed.Host != "market-artifacts.cos.ap-guangzhou.myqcloud.com" || parsed.Path != "/market/skill/demo/1.0.0/universal-abc.zip" {
+		t.Fatalf("presigned URL = %s", downloadURL)
+	}
+	for _, key := range []string{"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature"} {
+		if parsed.Query().Get(key) == "" {
+			t.Fatalf("presigned URL missing %s: %s", key, downloadURL)
+		}
+	}
 }
 
 func TestPublishSkillAndPublicAPIs(t *testing.T) {

@@ -6,6 +6,15 @@ type Config struct {
 	Addr                string
 	DatabasePath        string
 	ArtifactRoot        string
+	ArtifactStorage     string
+	S3Bucket            string
+	S3Region            string
+	S3Endpoint          string
+	S3Prefix            string
+	S3AccessKeyID       string
+	S3SecretAccessKey   string
+	S3SessionToken      string
+	S3PresignTTL        time.Duration
 	PublicBaseURL       string
 	AdminToken          string
 	ProxyToken          string
