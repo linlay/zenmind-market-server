@@ -1986,6 +1986,12 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 		t.Fatalf("latest resolve status=%d response=%s", rec.Code, rec.Body.String())
 	}
 	directArtifactPath := strings.TrimPrefix(latest.Asset.URL, "http://market.test")
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, directArtifactPath, nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("published artifact status=%d body=%s", rec.Code, rec.Body.String())
+	}
 
 	unpublish := func(version string, wantStatus int) {
 		t.Helper()

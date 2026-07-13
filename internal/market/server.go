@@ -760,7 +760,7 @@ func (a *App) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_path", "invalid artifact path")
 		return
 	}
-	if err := a.store.EnsurePublishedArtifactPath(r.Context(), filepath.ToSlash(relative)); errors.Is(err, sql.ErrNoRows) {
+	if err := a.store.EnsurePublishedArtifactPath(r.Context(), filepath.ToSlash(resolved)); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "not_found", "artifact not found")
 		return
 	} else if err != nil {
