@@ -372,9 +372,16 @@ func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemTy
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	version := canonicalVersion(r.URL.Query().Get("version"))
+	requestedVersion := canonicalVersion(r.URL.Query().Get("version"))
+	version := requestedVersion
 	if version == "" {
 		version = item.LatestVersion
+	} else if err := a.store.EnsurePublishedVersion(r.Context(), itemType, id, version); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market version not found")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
 	}
 	platform := strings.TrimSpace(r.URL.Query().Get("platform"))
 	platformSpec, platformErr := a.store.GetPlatform(r.Context(), itemType, id, version, platform)
@@ -702,6 +709,14 @@ func (a *App) handleUnpublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.Unpublish(r.Context(), itemType, sanitizeSlug(req.ID), canonicalVersion(req.Version)); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not_found", "market item or version not found")
+			return
+		}
+		if errors.Is(err, errUnpublishNotLatest) || err.Error() == "version is required" {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}

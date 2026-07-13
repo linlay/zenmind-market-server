@@ -302,11 +302,7 @@ func (s *Store) canonicalizeStoredVersions(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	defer func() { _ = tx.Rollback() }()
 	statements := []string{
 		`DELETE FROM versions
 			WHERE substr(version, 1, 1) IN ('v', 'V')
@@ -636,14 +632,89 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 func (s *Store) Unpublish(ctx context.Context, itemType ItemType, id, version string) error {
 	version = canonicalVersion(version)
 	if version == "" {
-		_, err := s.db.ExecContext(ctx, `UPDATE items SET published = 0, updated_at = ? WHERE type = ? AND id = ?`, time.Now().UTC().Format(time.RFC3339Nano), itemType, id)
+		return errors.New("version is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE version_platforms SET published = 0, updated_at = ? WHERE item_type = ? AND item_id = ? AND version = ?`, time.Now().UTC().Format(time.RFC3339Nano), itemType, id, version); err != nil {
+	defer func() { _ = tx.Rollback() }()
+
+	var latestVersion string
+	if err = tx.QueryRowContext(ctx, `SELECT latest_version FROM items WHERE type = ? AND id = ?`, itemType, id).Scan(&latestVersion); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE versions SET published = 0 WHERE item_type = ? AND item_id = ? AND version = ?`, itemType, id, version)
+	if version != canonicalVersion(latestVersion) {
+		return errUnpublishNotLatest
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE versions SET published = 0 WHERE item_type = ? AND item_id = ? AND version = ?`, itemType, id, version)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = tx.ExecContext(ctx, `UPDATE version_platforms SET published = 0, updated_at = ? WHERE item_type = ? AND item_id = ? AND version = ?`, now, itemType, id, version); err != nil {
+		return err
+	}
+
+	replacement, err := findLatestPublishedVersion(ctx, tx, itemType, id)
+	if err != nil {
+		return err
+	}
+	if replacement == "" {
+		_, err = tx.ExecContext(ctx, `UPDATE items SET published = 0, updated_at = ? WHERE type = ? AND id = ?`, now, itemType, id)
+	} else {
+		_, err = tx.ExecContext(ctx, `UPDATE items SET
+			latest_version = ?, creator_id = (SELECT creator_id FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			description = (SELECT description FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			readme = (SELECT readme FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			metadata_json = (SELECT metadata_json FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			dependencies_json = (SELECT dependencies_json FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			protocol_json = (SELECT protocol_json FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			adp_yaml = (SELECT adp_yaml FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			review_status = (SELECT review_status FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			review_note = (SELECT review_note FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			reviewed_at = (SELECT reviewed_at FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			reviewed_by = (SELECT reviewed_by FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
+			published = 1, updated_at = ?
+			WHERE type = ? AND id = ?`,
+			replacement,
+			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
+			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
+			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
+			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
+			now, itemType, id)
+	}
+	if err != nil {
+		return err
+	}
+	err = tx.Commit()
 	return err
+}
+
+var errUnpublishNotLatest = errors.New("only the current latest version can be unpublished")
+
+func findLatestPublishedVersion(ctx context.Context, tx *sql.Tx, itemType ItemType, id string) (string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT version FROM versions WHERE item_type = ? AND item_id = ? AND published = 1 AND review_status = ?`, itemType, id, ReviewStatusApproved)
+	if err != nil { return "", err }
+	defer rows.Close()
+	latest := ""
+	for rows.Next() {
+		var candidate string
+		if err := rows.Scan(&candidate); err != nil { return "", err }
+		if latest == "" {
+			if _, ok := compareSemanticVersions(candidate, candidate); ok { latest = candidate }
+			continue
+		}
+		if comparison, ok := compareSemanticVersions(candidate, latest); ok && comparison > 0 { latest = candidate }
+	}
+	return latest, rows.Err()
 }
 
 func (s *Store) UpdateReview(ctx context.Context, itemType ItemType, id, status, note, reviewer string) error {
@@ -805,7 +876,10 @@ func (s *Store) GetADPYAML(ctx context.Context, itemType ItemType, id, version s
 		}
 		return value, nil
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT adp_yaml FROM versions WHERE item_type = ? AND item_id = ? AND version = ? AND published = 1 AND review_status = ?`, itemType, id, version, ReviewStatusApproved)
+	row := s.db.QueryRowContext(ctx, `SELECT v.adp_yaml FROM versions v
+		JOIN items i ON i.type = v.item_type AND i.id = v.item_id
+		WHERE v.item_type = ? AND v.item_id = ? AND v.version = ?
+			AND v.published = 1 AND v.review_status = ? AND i.published = 1 AND i.review_status = ?`, itemType, id, version, ReviewStatusApproved, ReviewStatusApproved)
 	var value string
 	if err := row.Scan(&value); err != nil {
 		return "", err
@@ -837,10 +911,30 @@ func (s *Store) GetArtifact(ctx context.Context, itemType ItemType, id, version,
 	return storedArtifact{}, sql.ErrNoRows
 }
 
+func (s *Store) EnsurePublishedVersion(ctx context.Context, itemType ItemType, id, version string) error {
+	version = canonicalVersion(version)
+	if version == "" {
+		return sql.ErrNoRows
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1
+		FROM versions v
+		JOIN items i ON i.type = v.item_type AND i.id = v.item_id
+		WHERE v.item_type = ? AND v.item_id = ? AND v.version = ?
+			AND v.published = 1 AND v.review_status = ?
+			AND i.published = 1 AND i.review_status = ?`,
+		itemType, id, version, ReviewStatusApproved, ReviewStatusApproved)
+	var exists int
+	return row.Scan(&exists)
+}
+
 func (s *Store) getArtifact(ctx context.Context, itemType ItemType, id, version, platform string) (storedArtifact, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT platform_key, archive_type, asset_role, path, url, sha256, integrity, size_bytes
-		FROM artifacts WHERE item_type = ? AND item_id = ? AND version = ? AND platform_key = ?`,
-		itemType, id, version, platform)
+	row := s.db.QueryRowContext(ctx, `SELECT a.platform_key, a.archive_type, a.asset_role, a.path, a.url, a.sha256, a.integrity, a.size_bytes
+		FROM artifacts a
+		JOIN versions v ON v.item_type = a.item_type AND v.item_id = a.item_id AND v.version = a.version
+		JOIN items i ON i.type = a.item_type AND i.id = a.item_id
+		WHERE a.item_type = ? AND a.item_id = ? AND a.version = ? AND a.platform_key = ?
+			AND v.published = 1 AND v.review_status = ? AND i.published = 1 AND i.review_status = ?`,
+		itemType, id, version, platform, ReviewStatusApproved, ReviewStatusApproved)
 	var artifact storedArtifact
 	artifact.Version = version
 	err := row.Scan(&artifact.PlatformKey, &artifact.ArchiveType, &artifact.AssetRole, &artifact.Path, &artifact.URL, &artifact.SHA256, &artifact.Integrity, &artifact.SizeBytes)
@@ -868,9 +962,13 @@ func (s *Store) GetPlatform(ctx context.Context, itemType ItemType, id, version,
 }
 
 func (s *Store) getPlatform(ctx context.Context, itemType ItemType, id, version, platform string) (PublicPlatform, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT platform_key, os, arch, description, readme, min_desktop_version, metadata_json, dependencies_json, protocol_json
-		FROM version_platforms WHERE item_type = ? AND item_id = ? AND version = ? AND platform_key = ? AND published = 1`,
-		itemType, id, version, platform)
+	row := s.db.QueryRowContext(ctx, `SELECT p.platform_key, p.os, p.arch, p.description, p.readme, p.min_desktop_version, p.metadata_json, p.dependencies_json, p.protocol_json
+		FROM version_platforms p
+		JOIN versions v ON v.item_type = p.item_type AND v.item_id = p.item_id AND v.version = p.version
+		JOIN items i ON i.type = p.item_type AND i.id = p.item_id
+		WHERE p.item_type = ? AND p.item_id = ? AND p.version = ? AND p.platform_key = ? AND p.published = 1
+			AND v.published = 1 AND v.review_status = ? AND i.published = 1 AND i.review_status = ?`,
+		itemType, id, version, platform, ReviewStatusApproved, ReviewStatusApproved)
 	var spec PublicPlatform
 	var metadataJSON, dependenciesJSON, protocolJSON string
 	if err := row.Scan(&spec.Platform, &spec.OS, &spec.Arch, &spec.Description, &spec.Readme, &spec.MinDesktopVersion, &metadataJSON, &dependenciesJSON, &protocolJSON); err != nil {
@@ -1018,11 +1116,12 @@ func (s *Store) loadAssetsForItems(ctx context.Context, items []storedItem, only
 	}
 	query := `SELECT a.item_type, a.item_id, a.version, a.platform_key, a.archive_type, a.asset_role, a.url, a.sha256, a.integrity, a.size_bytes
 		FROM artifacts a
-		JOIN items i ON i.type = a.item_type AND i.id = a.item_id AND i.latest_version = a.version`
+		JOIN items i ON i.type = a.item_type AND i.id = a.item_id AND i.latest_version = a.version
+		JOIN versions v ON v.item_type = a.item_type AND v.item_id = a.item_id AND v.version = a.version`
 	args := []any{}
 	if publicOnly {
-		query += ` WHERE i.published = 1 AND i.review_status = ?`
-		args = append(args, ReviewStatusApproved)
+		query += ` WHERE i.published = 1 AND i.review_status = ? AND v.published = 1 AND v.review_status = ?`
+		args = append(args, ReviewStatusApproved, ReviewStatusApproved)
 	}
 	if onlyType != "" {
 		if publicOnly {
@@ -1181,11 +1280,12 @@ func (s *Store) loadPlatformsForItems(ctx context.Context, items []storedItem, o
 	}
 	query := `SELECT p.item_type, p.item_id, p.version, p.platform_key, p.os, p.arch, p.description, p.readme, p.min_desktop_version, p.metadata_json, p.dependencies_json, p.protocol_json
 		FROM version_platforms p
-		JOIN items i ON i.type = p.item_type AND i.id = p.item_id AND i.latest_version = p.version`
+		JOIN items i ON i.type = p.item_type AND i.id = p.item_id AND i.latest_version = p.version
+		JOIN versions v ON v.item_type = p.item_type AND v.item_id = p.item_id AND v.version = p.version`
 	args := []any{}
 	if publicOnly {
-		query += ` WHERE i.published = 1 AND i.review_status = ? AND p.published = 1`
-		args = append(args, ReviewStatusApproved)
+		query += ` WHERE i.published = 1 AND i.review_status = ? AND p.published = 1 AND v.published = 1 AND v.review_status = ?`
+		args = append(args, ReviewStatusApproved, ReviewStatusApproved)
 	}
 	if onlyType != "" {
 		if publicOnly {

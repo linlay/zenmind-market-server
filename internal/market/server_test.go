@@ -800,7 +800,7 @@ func TestFavoriteItemsUseTrustedProxyUser(t *testing.T) {
 	_ = favoriteRequest(t, handler, http.MethodPost, "/api/v1/skills/missing/favorite", "alice", http.StatusNotFound)
 	_ = favoriteRequest(t, handler, http.MethodDelete, "/api/v1/skills/missing/favorite", "alice", http.StatusNotFound)
 
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"favorite-demo"}`))
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"favorite-demo","version":"1.0.0"}`))
 	req.Header.Set("Authorization", "Bearer secret")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -1071,12 +1071,12 @@ func TestSSOJWTAdminAuthAndAudienceValidation(t *testing.T) {
 		Scope:    "profile market tunnel",
 		Expires:  time.Now().Add(time.Hour),
 	})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"missing"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"missing","version":"1.0.0"}`))
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("admin JWT status = %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("admin JWT status = %d, want 404 body=%s", rec.Code, rec.Body.String())
 	}
 
 	wrongAudienceToken := signTestSSOJWT(t, privateKey, testSSOJWTClaims{
@@ -1966,6 +1966,77 @@ func TestADPManifestPublishNormalizeAndEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"adpInstallUrl":"/api/v1/adp/cli-tool/zmctl"`) {
 		t.Fatalf("catalog missing adpInstallUrl: %s", rec.Body.String())
+	}
+}
+
+func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	archive := zipArchive(t, map[string]string{"demo/SKILL.md": "# Demo\n"})
+	for _, version := range []string{"1.2.0", "1.10.0", "2.0.0"} {
+		publishMultipart(t, handler, PublishRequest{
+			Type: TypeSkill, ID: "rollback-demo", Name: "Rollback Demo", Version: version, ArchiveType: "zip",
+		}, archive)
+	}
+
+	unpublish := func(version string, wantStatus int) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"rollback-demo","version":"`+version+`"}`))
+		req.Header.Set("Authorization", "Bearer secret")
+		handler.ServeHTTP(rec, req)
+		if rec.Code != wantStatus {
+			t.Fatalf("unpublish %s status = %d, want %d: %s", version, rec.Code, wantStatus, rec.Body.String())
+		}
+	}
+
+	// A historical version is never eligible for the lifecycle action.
+	unpublish("1.2.0", http.StatusBadRequest)
+	unpublish("2.0.0", http.StatusOK)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fallback item status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var item PublicItem
+	if err := json.Unmarshal(rec.Body.Bytes(), &item); err != nil {
+		t.Fatalf("decode fallback item: %v", err)
+	}
+	if item.Version != "1.10.0" {
+		t.Fatalf("fallback version = %q, want 1.10.0", item.Version)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo/resolve", nil)
+	handler.ServeHTTP(rec, req)
+	var resolved ResolveResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &resolved) != nil || resolved.Version != "1.10.0" || resolved.Asset == nil {
+		t.Fatalf("fallback resolve status=%d response=%s", rec.Code, rec.Body.String())
+	}
+
+	for _, endpoint := range []string{
+		"/api/v1/skills/rollback-demo/resolve?version=2.0.0",
+		"/api/v1/skills/rollback-demo/download?version=2.0.0",
+		"/api/v1/adp/skill/rollback-demo?version=2.0.0",
+	} {
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, endpoint, nil)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("unpublished endpoint %s status = %d, want 404: %s", endpoint, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Once the last public version is gone, the whole item disappears.
+	unpublish("1.10.0", http.StatusOK)
+	unpublish("1.2.0", http.StatusOK)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("last-version item status = %d, want 404: %s", rec.Code, rec.Body.String())
 	}
 }
 
