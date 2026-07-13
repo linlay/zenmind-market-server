@@ -75,25 +75,49 @@ type semanticVersion struct {
 
 func parseSemanticVersion(value string) (semanticVersion, bool) {
 	value = canonicalVersion(value)
-	if value == "" { return semanticVersion{}, false }
-	withoutBuild := strings.SplitN(value, "+", 2)[0]
+	if value == "" {
+		return semanticVersion{}, false
+	}
+	buildParts := strings.Split(value, "+")
+	if len(buildParts) > 2 || (len(buildParts) == 2 && !validIdentifierList(buildParts[1], false)) {
+		return semanticVersion{}, false
+	}
+	withoutBuild := buildParts[0]
 	parts := strings.SplitN(withoutBuild, "-", 2)
 	core := strings.Split(parts[0], ".")
-	if len(core) != 3 { return semanticVersion{}, false }
+	if len(core) != 3 {
+		return semanticVersion{}, false
+	}
 	var result semanticVersion
 	for i, part := range core {
 		number, ok := numericIdentifier(part)
-		if !ok || (len(part) > 1 && part[0] == '0') { return semanticVersion{}, false }
+		if !ok || (len(part) > 1 && part[0] == '0') {
+			return semanticVersion{}, false
+		}
 		result.core[i] = number
 	}
 	if len(parts) == 2 {
-		if parts[1] == "" { return semanticVersion{}, false }
-		for _, part := range strings.Split(parts[1], ".") {
-			if part == "" || !validIdentifier(part) || (len(part) > 1 && part[0] == '0' && isDigits(part)) { return semanticVersion{}, false }
+		if !validIdentifierList(parts[1], true) {
+			return semanticVersion{}, false
 		}
 		result.pre = parts[1]
 	}
 	return result, true
+}
+
+func validIdentifierList(value string, forbidNumericLeadingZero bool) bool {
+	if value == "" {
+		return false
+	}
+	for _, part := range strings.Split(value, ".") {
+		if part == "" || !validIdentifier(part) {
+			return false
+		}
+		if forbidNumericLeadingZero && len(part) > 1 && part[0] == '0' && isDigits(part) {
+			return false
+		}
+	}
+	return true
 }
 
 func numericIdentifier(value string) (int64, bool) {

@@ -927,6 +927,19 @@ func (s *Store) EnsurePublishedVersion(ctx context.Context, itemType ItemType, i
 	return row.Scan(&exists)
 }
 
+func (s *Store) EnsurePublishedArtifactPath(ctx context.Context, artifactPath string) error {
+	row := s.db.QueryRowContext(ctx, `SELECT 1
+		FROM artifacts a
+		JOIN versions v ON v.item_type = a.item_type AND v.item_id = a.item_id AND v.version = a.version
+		JOIN items i ON i.type = a.item_type AND i.id = a.item_id
+		WHERE a.path = ?
+			AND v.published = 1 AND v.review_status = ?
+			AND i.published = 1 AND i.review_status = ?`,
+		artifactPath, ReviewStatusApproved, ReviewStatusApproved)
+	var exists int
+	return row.Scan(&exists)
+}
+
 func (s *Store) getArtifact(ctx context.Context, itemType ItemType, id, version, platform string) (storedArtifact, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT a.platform_key, a.archive_type, a.asset_role, a.path, a.url, a.sha256, a.integrity, a.size_bytes
 		FROM artifacts a

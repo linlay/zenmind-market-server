@@ -1978,6 +1978,14 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 			Type: TypeSkill, ID: "rollback-demo", Name: "Rollback Demo", Version: version, ArchiveType: "zip",
 		}, archive)
 	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo/resolve?version=2.0.0", nil)
+	handler.ServeHTTP(rec, req)
+	var latest ResolveResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &latest) != nil || latest.Asset == nil {
+		t.Fatalf("latest resolve status=%d response=%s", rec.Code, rec.Body.String())
+	}
+	directArtifactPath := strings.TrimPrefix(latest.Asset.URL, "http://market.test")
 
 	unpublish := func(version string, wantStatus int) {
 		t.Helper()
@@ -1994,8 +2002,8 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 	unpublish("1.2.0", http.StatusBadRequest)
 	unpublish("2.0.0", http.StatusOK)
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo", nil)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo", nil)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("fallback item status = %d: %s", rec.Code, rec.Body.String())
@@ -2020,6 +2028,7 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 		"/api/v1/skills/rollback-demo/resolve?version=2.0.0",
 		"/api/v1/skills/rollback-demo/download?version=2.0.0",
 		"/api/v1/adp/skill/rollback-demo?version=2.0.0",
+		directArtifactPath,
 	} {
 		rec = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodGet, endpoint, nil)
