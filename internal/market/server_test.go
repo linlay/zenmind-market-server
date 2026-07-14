@@ -37,12 +37,13 @@ func newTestAppWithConfig(t *testing.T, override Config) *App {
 	t.Helper()
 	root := t.TempDir()
 	cfg := Config{
-		DatabasePath:   filepath.Join(root, "market.db"),
-		ArtifactRoot:   filepath.Join(root, "artifacts"),
-		PublicBaseURL:  "http://market.test",
-		AdminToken:     "secret",
-		ProxyToken:     "proxy-secret",
-		MaxUploadBytes: 10 * 1024 * 1024,
+		DatabasePath:    filepath.Join(root, "market.db"),
+		ArtifactRoot:    filepath.Join(root, "artifacts"),
+		PublicBaseURL:   "http://market.test",
+		AdminToken:      "secret",
+		ProxyToken:      "proxy-secret",
+		MaxUploadBytes:  10 * 1024 * 1024,
+		EnableLocalAuth: true,
 	}
 	if override.SSOJWTIssuer != "" {
 		cfg.SSOJWTIssuer = override.SSOJWTIssuer
@@ -80,6 +81,166 @@ func TestOpenDefaultsToLocalArtifactStorage(t *testing.T) {
 	app := newTestApp(t)
 	if _, ok := app.artifactStorage.(*localArtifactStorage); !ok {
 		t.Fatalf("artifact storage = %T, want *localArtifactStorage", app.artifactStorage)
+	}
+}
+
+func TestRandomOIDCStateIsOpaqueHex(t *testing.T) {
+	state, err := randomOIDCState()
+	if err != nil {
+		t.Fatalf("randomOIDCState() error = %v", err)
+	}
+	if len(state) != 64 {
+		t.Fatalf("state length = %d, want 64", len(state))
+	}
+	for _, char := range state {
+		if !strings.ContainsRune("0123456789abcdef", char) {
+			t.Fatalf("state contains non-hex character %q", char)
+		}
+	}
+	secondState, err := randomOIDCState()
+	if err != nil {
+		t.Fatalf("second randomOIDCState() error = %v", err)
+	}
+	if state == secondState {
+		t.Fatal("two generated states must not match")
+	}
+}
+
+func TestOIDCIdentityClaimsPreferHumanReadableValues(t *testing.T) {
+	username, name := oidcIdentityClaims(map[string]any{
+		"preferred_username": "agent-builder",
+		"name":               "Agent Builder",
+	}, "oidc-subject")
+	if username != "agent-builder" || name != "Agent Builder" {
+		t.Fatalf("identity = (%q, %q), want preferred username and name", username, name)
+	}
+	username, name = oidcIdentityClaims(map[string]any{"email": "builder@example.test"}, "oidc-subject")
+	if username != "builder@example.test" || name != "builder@example.test" {
+		t.Fatalf("fallback identity = (%q, %q), want email", username, name)
+	}
+}
+
+func TestRedactedOIDCClaimsRemovesSensitiveValues(t *testing.T) {
+	claims := redactedOIDCClaims(map[string]any{
+		"sub":            "user-123",
+		"custom_token":   "should-not-log",
+		"client_secret":  "should-not-log",
+		"email":          "builder@example.test",
+		"phone_number":   "+86-18000000000",
+		"email_verified": true,
+	})
+	if claims["sub"] != "[redacted]" {
+		t.Fatalf("sub = %#v, want [redacted]", claims["sub"])
+	}
+	if claims["custom_token"] != "[redacted]" || claims["client_secret"] != "[redacted]" || claims["email"] != "[redacted]" || claims["phone_number"] != "[redacted]" {
+		t.Fatalf("sensitive claims = %#v, want redacted", claims)
+	}
+	if claims["email_verified"] != true {
+		t.Fatalf("email_verified = %#v, want true", claims["email_verified"])
+	}
+}
+
+func TestStoreUpsertOIDCUserUsesStaffNumberAndStableIdentity(t *testing.T) {
+	app := newTestApp(t)
+	first, err := app.store.UpsertOIDCUser(context.Background(), oidcUserProfile{
+		Issuer:          "https://identity.example.test/oidc",
+		Subject:         "053624",
+		Username:        "zhengpuruo",
+		DisplayName:     "Zheng Puruo",
+		Email:           "zhengpuruo@example.test",
+		ProviderAccount: "zhengpuruo",
+		StaffNumber:     "129943",
+	})
+	if err != nil {
+		t.Fatalf("UpsertOIDCUser() error = %v", err)
+	}
+	if first.ID != "129943" {
+		t.Fatalf("user ID = %q, want staff number", first.ID)
+	}
+	if first.Username != "zhengpuruo" || first.DisplayName != "Zheng Puruo" || first.Role != "creator" {
+		t.Fatalf("first user = %+v", first)
+	}
+	second, err := app.store.UpsertOIDCUser(context.Background(), oidcUserProfile{
+		Issuer:      "https://identity.example.test/oidc",
+		Subject:     "053624",
+		Username:    "different-name",
+		DisplayName: "Updated Display Name",
+		Email:       "updated@example.test",
+		StaffNumber: "129943",
+		IsAdmin:     true,
+	})
+	if err != nil {
+		t.Fatalf("second UpsertOIDCUser() error = %v", err)
+	}
+	if second.ID != first.ID || second.Username != "zhengpuruo" || second.DisplayName != "Updated Display Name" || second.Role != "admin" {
+		t.Fatalf("second user = %+v", second)
+	}
+}
+
+func TestStoreUpsertOIDCUserPreservesEmailVerificationWhenClaimIsMissing(t *testing.T) {
+	app := newTestApp(t)
+	first, err := app.store.UpsertOIDCUser(context.Background(), oidcUserProfile{
+		Issuer: "https://identity.example.test/oidc", Subject: "email-verified-subject", Username: "email-verified", Email: "verified@example.test", EmailVerified: true, HasEmailVerified: true,
+	})
+	if err != nil {
+		t.Fatalf("first UpsertOIDCUser() error = %v", err)
+	}
+	second, err := app.store.UpsertOIDCUser(context.Background(), oidcUserProfile{
+		Issuer: "https://identity.example.test/oidc", Subject: "email-verified-subject", Email: "verified@example.test",
+	})
+	if err != nil {
+		t.Fatalf("second UpsertOIDCUser() error = %v", err)
+	}
+	if first.ID != second.ID || !second.EmailVerified {
+		t.Fatalf("second user = %+v, want preserved email verification", second)
+	}
+}
+
+func TestOpenKeepsCatalogAvailableWhenOIDCProviderIsUnavailable(t *testing.T) {
+	root := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	app, err := Open(ctx, Config{
+		DatabasePath: filepath.Join(root, "market.db"), ArtifactRoot: filepath.Join(root, "artifacts"), PublicBaseURL: "http://market.test",
+		OIDCIssuer: "http://127.0.0.1:1", OIDCClientID: "client", OIDCClientSecret: "secret", OIDCSessionSecret: "session-secret",
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = app.Close() })
+	if app.currentOIDCClient() != nil {
+		t.Fatal("OIDC client should not initialize when discovery is unavailable")
+	}
+	response := httptest.NewRecorder()
+	app.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("health response = %d, want %d", response.Code, http.StatusOK)
+	}
+}
+
+func TestStoreUpsertOIDCUserRekeysLegacyUserToStaffNumber(t *testing.T) {
+	app := newTestApp(t)
+	legacy, err := app.store.UpsertOIDCUser(context.Background(), oidcUserProfile{
+		Issuer:   "https://identity.example.test/oidc",
+		Subject:  "legacy-subject",
+		Username: "legacy-user",
+	})
+	if err != nil {
+		t.Fatalf("legacy UpsertOIDCUser() error = %v", err)
+	}
+	if !strings.HasPrefix(legacy.ID, "usr_") {
+		t.Fatalf("legacy user ID = %q, want generated ID", legacy.ID)
+	}
+	rekeyed, err := app.store.UpsertOIDCUser(context.Background(), oidcUserProfile{
+		Issuer:      "https://identity.example.test/oidc",
+		Subject:     "legacy-subject",
+		StaffNumber: "10053624",
+	})
+	if err != nil {
+		t.Fatalf("rekeyed UpsertOIDCUser() error = %v", err)
+	}
+	if rekeyed.ID != "10053624" {
+		t.Fatalf("rekeyed user ID = %q, want staff number", rekeyed.ID)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +26,8 @@ type App struct {
 	store           *Store
 	artifactStorage artifactStorage
 	ssoJWT          *ssoJWTVerifier
+	oidc            *oidcClient
+	oidcMu          sync.Mutex
 }
 
 func Open(ctx context.Context, cfg Config) (*App, error) {
@@ -43,7 +47,35 @@ func Open(ctx context.Context, cfg Config) (*App, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	return &App{cfg: cfg, store: store, artifactStorage: storage, ssoJWT: ssoJWT}, nil
+	oidc, err := newOIDCClient(ctx, cfg)
+	if err != nil {
+		// The catalog should remain available while a remote OIDC provider recovers.
+		log.Printf("OIDC initialization deferred: %v", err)
+	}
+	return &App{cfg: cfg, store: store, artifactStorage: storage, ssoJWT: ssoJWT, oidc: oidc}, nil
+}
+
+func (a *App) ensureOIDCClient(ctx context.Context) (*oidcClient, error) {
+	if strings.TrimSpace(a.cfg.OIDCIssuer) == "" {
+		return nil, nil
+	}
+	a.oidcMu.Lock()
+	defer a.oidcMu.Unlock()
+	if a.oidc != nil {
+		return a.oidc, nil
+	}
+	client, err := newOIDCClient(ctx, a.cfg)
+	if err != nil {
+		return nil, err
+	}
+	a.oidc = client
+	return client, nil
+}
+
+func (a *App) currentOIDCClient() *oidcClient {
+	a.oidcMu.Lock()
+	defer a.oidcMu.Unlock()
+	return a.oidc
 }
 
 func (a *App) Close() error {
@@ -53,8 +85,14 @@ func (a *App) Close() error {
 func (a *App) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.handleHealth)
-	mux.HandleFunc("POST /api/v1/auth/login", a.handleLocalLogin)
+	if a.cfg.EnableLocalAuth {
+		mux.HandleFunc("POST /api/v1/auth/login", a.handleLocalLogin)
+	}
 	mux.HandleFunc("GET /api/v1/auth/me", a.handleAuthMe)
+	mux.HandleFunc("GET /api/v1/me/favorites", a.handleMyFavorites)
+	mux.HandleFunc("GET /api/v1/auth/oidc/login", a.handleOIDCLogin)
+	mux.HandleFunc("GET /api/v1/auth/oidc/callback", a.handleOIDCCallback)
+	mux.HandleFunc("POST /api/v1/auth/oidc/logout", a.handleOIDCLogout)
 	mux.HandleFunc("GET /api/v1/markets", a.handleMarkets)
 	mux.HandleFunc("GET /api/v1/catalog", a.handleCatalog)
 	mux.HandleFunc("GET /api/v1/desktop/catalog", a.handleDesktopCatalog)
@@ -133,6 +171,10 @@ func (a *App) handleLocalLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleAuthMe(w http.ResponseWriter, r *http.Request) {
+	if user, ok := a.oidcUserFromRequest(r); ok {
+		writeJSON(w, http.StatusOK, map[string]any{"user": user})
+		return
+	}
 	if user, ok := a.localUserFromRequest(r); ok {
 		writeJSON(w, http.StatusOK, map[string]any{"user": user})
 		return
@@ -150,6 +192,21 @@ func (a *App) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeError(w, http.StatusUnauthorized, "unauthorized", "login required")
+}
+
+func (a *App) handleMyFavorites(w http.ResponseWriter, r *http.Request) {
+	userID, ok := a.authorizedMarketUser(w, r)
+	if !ok {
+		return
+	}
+	items, err := a.store.ListFavorites(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	result := marketItems(items)
+	sortPublicItems(result)
+	writeJSON(w, http.StatusOK, CatalogResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC(), Items: result})
 }
 
 func (a *App) handleCatalog(w http.ResponseWriter, r *http.Request) {
@@ -894,9 +951,11 @@ type authResult struct {
 }
 
 type localUser struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Role string `json:"role"`
+	ID       string `json:"id"`
+	Username string `json:"username,omitempty"`
+	Name     string `json:"name"`
+	Email    string `json:"email,omitempty"`
+	Role     string `json:"role"`
 }
 
 func allowAuth() authResult {
@@ -913,6 +972,12 @@ func (a *App) authorizedAdmin(r *http.Request) authResult {
 		return allowAuth()
 	}
 	if user, ok := a.localUserFromRequest(r); ok {
+		if user.Role == "admin" {
+			return allowAuth()
+		}
+		return denyAuth(http.StatusForbidden, "forbidden", "admin role required")
+	}
+	if user, ok := a.oidcUserFromRequest(r); ok {
 		if user.Role == "admin" {
 			return allowAuth()
 		}
@@ -944,6 +1009,9 @@ func (a *App) authorizedAdmin(r *http.Request) authResult {
 }
 
 func (a *App) viewerUserID(r *http.Request) string {
+	if user, ok := a.oidcUserFromRequest(r); ok {
+		return user.ID
+	}
 	if user, ok := a.localUserFromRequest(r); ok {
 		return user.ID
 	}
@@ -957,6 +1025,9 @@ func (a *App) viewerUserID(r *http.Request) string {
 }
 
 func (a *App) reviewerID(r *http.Request) string {
+	if user, ok := a.oidcUserFromRequest(r); ok {
+		return user.ID
+	}
 	if user, ok := a.localUserFromRequest(r); ok {
 		return user.ID
 	}
@@ -973,6 +1044,9 @@ func (a *App) reviewerID(r *http.Request) string {
 }
 
 func (a *App) authorizedMarketUser(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if user, ok := a.oidcUserFromRequest(r); ok {
+		return user.ID, true
+	}
 	if user, ok := a.localUserFromRequest(r); ok {
 		return user.ID, true
 	}
@@ -1003,6 +1077,9 @@ func (a *App) authorizedMarketUser(w http.ResponseWriter, r *http.Request) (stri
 }
 
 func (a *App) localUserFromRequest(r *http.Request) (localUser, bool) {
+	if !a.cfg.EnableLocalAuth {
+		return localUser{}, false
+	}
 	return decodeLocalUserToken(bearerToken(r.Header.Get("Authorization")))
 }
 

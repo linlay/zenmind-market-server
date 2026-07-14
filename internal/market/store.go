@@ -2,7 +2,9 @@ package market
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,30 @@ import (
 
 type Store struct {
 	db *sql.DB
+}
+
+type oidcUserProfile struct {
+	Issuer           string
+	Subject          string
+	Username         string
+	DisplayName      string
+	Email            string
+	EmailVerified    bool
+	HasEmailVerified bool
+	ProviderAccount  string
+	ExternalUserID   string
+	StaffNumber      string
+	IsAdmin          bool
+}
+
+type marketUser struct {
+	ID            string
+	Username      string
+	DisplayName   string
+	Email         string
+	EmailVerified bool
+	Status        string
+	Role          string
 }
 
 func OpenStore(ctx context.Context, databasePath string) (*Store, error) {
@@ -40,9 +66,225 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+func (s *Store) UpsertOIDCUser(ctx context.Context, profile oidcUserProfile) (marketUser, error) {
+	profile.Issuer = strings.TrimSpace(profile.Issuer)
+	profile.Subject = strings.TrimSpace(profile.Subject)
+	if profile.Issuer == "" || profile.Subject == "" {
+		return marketUser{}, errors.New("OIDC issuer and subject are required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return marketUser{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var userID string
+	err = tx.QueryRowContext(ctx, `SELECT user_id FROM user_identities WHERE issuer = ? AND subject = ?`, profile.Issuer, profile.Subject).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		userID, err = marketUserIDForProfile(profile)
+		if err != nil {
+			return marketUser{}, err
+		}
+		username, err := nextAvailableUsername(ctx, tx, profile.Username, profile.Subject)
+		if err != nil {
+			return marketUser{}, err
+		}
+		displayName := strings.TrimSpace(profile.DisplayName)
+		if displayName == "" {
+			displayName = username
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO users (
+			id, username, display_name, email, email_verified, status, created_at, updated_at, last_login_at
+		) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+			userID, username, displayName, strings.TrimSpace(profile.Email), boolToInt(profile.EmailVerified), now, now, now); err != nil {
+			return marketUser{}, err
+		}
+		identityID, err := newMarketUserID()
+		if err != nil {
+			return marketUser{}, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO user_identities (
+			id, user_id, issuer, subject, provider_account, external_user_id, staff_number, linked_at, last_seen_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			identityID, userID, profile.Issuer, profile.Subject, strings.TrimSpace(profile.ProviderAccount), strings.TrimSpace(profile.ExternalUserID), strings.TrimSpace(profile.StaffNumber), now, now); err != nil {
+			return marketUser{}, err
+		}
+	} else if err != nil {
+		return marketUser{}, err
+	} else {
+		if staffNumber := strings.TrimSpace(profile.StaffNumber); staffNumber != "" && userID != staffNumber {
+			if err = rekeyMarketUser(ctx, tx, userID, staffNumber); err != nil {
+				return marketUser{}, err
+			}
+			userID = staffNumber
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE users SET
+			display_name = CASE WHEN ? <> '' THEN ? ELSE display_name END,
+			email = CASE WHEN ? <> '' THEN ? ELSE email END,
+			email_verified = CASE WHEN ? <> 0 THEN ? ELSE email_verified END, updated_at = ?, last_login_at = ?
+			WHERE id = ?`,
+			strings.TrimSpace(profile.DisplayName), strings.TrimSpace(profile.DisplayName), strings.TrimSpace(profile.Email), strings.TrimSpace(profile.Email), boolToInt(profile.HasEmailVerified), boolToInt(profile.EmailVerified), now, now, userID); err != nil {
+			return marketUser{}, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE user_identities SET provider_account = ?, external_user_id = ?, staff_number = ?, last_seen_at = ? WHERE issuer = ? AND subject = ?`,
+			strings.TrimSpace(profile.ProviderAccount), strings.TrimSpace(profile.ExternalUserID), strings.TrimSpace(profile.StaffNumber), now, profile.Issuer, profile.Subject); err != nil {
+			return marketUser{}, err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM user_roles WHERE user_id = ? AND source = 'oidc'`, userID); err != nil {
+		return marketUser{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO user_roles (user_id, role, source, granted_at) VALUES (?, 'creator', 'oidc', ?)`, userID, now); err != nil {
+		return marketUser{}, err
+	}
+	if profile.IsAdmin {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO user_roles (user_id, role, source, granted_at) VALUES (?, 'admin', 'oidc', ?)`, userID, now); err != nil {
+			return marketUser{}, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return marketUser{}, err
+	}
+	return s.GetMarketUser(ctx, userID)
+}
+
+func (s *Store) GetMarketUser(ctx context.Context, userID string) (marketUser, error) {
+	var user marketUser
+	var verified int
+	err := s.db.QueryRowContext(ctx, `SELECT id, username, display_name, email, email_verified, status FROM users WHERE id = ?`, strings.TrimSpace(userID)).Scan(
+		&user.ID, &user.Username, &user.DisplayName, &user.Email, &verified, &user.Status,
+	)
+	if err != nil {
+		return marketUser{}, err
+	}
+	user.EmailVerified = verified == 1
+	rows, err := s.db.QueryContext(ctx, `SELECT role FROM user_roles WHERE user_id = ? ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END`, user.ID)
+	if err != nil {
+		return marketUser{}, err
+	}
+	defer rows.Close()
+	user.Role = "creator"
+	for rows.Next() {
+		var role string
+		if err := rows.Scan(&role); err != nil {
+			return marketUser{}, err
+		}
+		if role == "admin" {
+			user.Role = "admin"
+			break
+		}
+	}
+	return user, rows.Err()
+}
+
+func newMarketUserID() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return "usr_" + hex.EncodeToString(raw), nil
+}
+
+func marketUserIDForProfile(profile oidcUserProfile) (string, error) {
+	if staffNumber := strings.TrimSpace(profile.StaffNumber); staffNumber != "" {
+		if strings.ContainsAny(staffNumber, "\r\n\t ") {
+			return "", errors.New("OIDC staff number contains whitespace")
+		}
+		return staffNumber, nil
+	}
+	return newMarketUserID()
+}
+
+func rekeyMarketUser(ctx context.Context, tx *sql.Tx, oldID, newID string) error {
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)`, newID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 1 {
+		return errors.New("OIDC staff number is already assigned to another market user")
+	}
+	for _, query := range []string{
+		`UPDATE items SET creator_id = ? WHERE creator_id = ?`,
+		`UPDATE versions SET creator_id = ? WHERE creator_id = ?`,
+		`UPDATE favorite_items SET user_id = ? WHERE user_id = ?`,
+		`UPDATE items SET reviewed_by = ? WHERE reviewed_by = ?`,
+		`UPDATE versions SET reviewed_by = ? WHERE reviewed_by = ?`,
+		`UPDATE user_roles SET user_id = ? WHERE user_id = ?`,
+		`UPDATE user_identities SET user_id = ? WHERE user_id = ?`,
+		`UPDATE users SET id = ? WHERE id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, query, newID, oldID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func nextAvailableUsername(ctx context.Context, tx *sql.Tx, preferred, fallback string) (string, error) {
+	base := strings.TrimSpace(preferred)
+	if base == "" {
+		base = strings.TrimSpace(fallback)
+	}
+	if base == "" {
+		base = "market-user"
+	}
+	for suffix := 0; ; suffix++ {
+		candidate := base
+		if suffix > 0 {
+			candidate = fmt.Sprintf("%s-%d", base, suffix+1)
+		}
+		var exists int
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE username = ? COLLATE NOCASE)`, candidate).Scan(&exists)
+		if err != nil {
+			return "", err
+		}
+		if exists == 0 {
+			return candidate, nil
+		}
+	}
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	statements := []string{
 		`PRAGMA journal_mode = WAL`,
+		`CREATE TABLE IF NOT EXISTS users (
+			id TEXT PRIMARY KEY,
+			username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+			display_name TEXT NOT NULL DEFAULT '',
+			email TEXT NOT NULL DEFAULT '',
+			email_verified INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'active',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			last_login_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS user_identities (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			issuer TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			provider_account TEXT NOT NULL DEFAULT '',
+			external_user_id TEXT NOT NULL DEFAULT '',
+			staff_number TEXT NOT NULL DEFAULT '',
+			linked_at TEXT NOT NULL,
+			last_seen_at TEXT NOT NULL,
+			UNIQUE (issuer, subject)
+		)`,
+		`CREATE TABLE IF NOT EXISTS user_roles (
+			user_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			source TEXT NOT NULL,
+			granted_at TEXT NOT NULL,
+			PRIMARY KEY (user_id, role, source)
+		)`,
 		`CREATE TABLE IF NOT EXISTS items (
 			type TEXT NOT NULL,
 			id TEXT NOT NULL,
@@ -163,6 +405,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_download_events_item ON download_events (item_type, item_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_favorite_items_item ON favorite_items (item_type, item_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_identities_user ON user_identities (user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles (user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_skill_profiles_category ON skill_profiles (kind, category)`,
 	}
 	for _, statement := range statements {
@@ -171,6 +415,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	if err := s.ensureColumn(ctx, "items", "website_kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "user_identities", "staff_number", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "items", "creator_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -702,17 +949,25 @@ var errUnpublishNotLatest = errors.New("only the current latest version can be u
 
 func findLatestPublishedVersion(ctx context.Context, tx *sql.Tx, itemType ItemType, id string) (string, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT version FROM versions WHERE item_type = ? AND item_id = ? AND published = 1 AND review_status = ?`, itemType, id, ReviewStatusApproved)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	defer rows.Close()
 	latest := ""
 	for rows.Next() {
 		var candidate string
-		if err := rows.Scan(&candidate); err != nil { return "", err }
+		if err := rows.Scan(&candidate); err != nil {
+			return "", err
+		}
 		if latest == "" {
-			if _, ok := compareSemanticVersions(candidate, candidate); ok { latest = candidate }
+			if _, ok := compareSemanticVersions(candidate, candidate); ok {
+				latest = candidate
+			}
 			continue
 		}
-		if comparison, ok := compareSemanticVersions(candidate, latest); ok && comparison > 0 { latest = candidate }
+		if comparison, ok := compareSemanticVersions(candidate, latest); ok && comparison > 0 {
+			latest = candidate
+		}
 	}
 	return latest, rows.Err()
 }
@@ -749,18 +1004,26 @@ func (s *Store) UpdateReview(ctx context.Context, itemType ItemType, id, status,
 }
 
 func (s *Store) ListPublic(ctx context.Context, onlyType ItemType, viewerUserID string) ([]storedItem, error) {
-	return s.listItems(ctx, onlyType, "", viewerUserID, true, "")
+	return s.listItems(ctx, onlyType, "", viewerUserID, true, "", "")
 }
 
 func (s *Store) ListAdmin(ctx context.Context, onlyType ItemType, reviewStatus, viewerUserID string) ([]storedItem, error) {
-	return s.listItems(ctx, onlyType, reviewStatus, viewerUserID, false, "")
+	return s.listItems(ctx, onlyType, reviewStatus, viewerUserID, false, "", "")
 }
 
 func (s *Store) ListCreator(ctx context.Context, creatorID, viewerUserID string) ([]storedItem, error) {
-	return s.listItems(ctx, "", "", viewerUserID, false, strings.TrimSpace(creatorID))
+	return s.listItems(ctx, "", "", viewerUserID, false, strings.TrimSpace(creatorID), "")
 }
 
-func (s *Store) listItems(ctx context.Context, onlyType ItemType, reviewStatus, viewerUserID string, publicOnly bool, creatorID string) ([]storedItem, error) {
+func (s *Store) ListFavorites(ctx context.Context, userID string) ([]storedItem, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, errors.New("user ID is required")
+	}
+	return s.listItems(ctx, "", "", userID, true, "", userID)
+}
+
+func (s *Store) listItems(ctx context.Context, onlyType ItemType, reviewStatus, viewerUserID string, publicOnly bool, creatorID, favoriteUserID string) ([]storedItem, error) {
 	query := `SELECT type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, published_at, updated_at
 			FROM items`
 	args := []any{}
@@ -780,6 +1043,10 @@ func (s *Store) listItems(ctx context.Context, onlyType ItemType, reviewStatus, 
 	if creatorID != "" {
 		conditions = append(conditions, `creator_id = ?`)
 		args = append(args, creatorID)
+	}
+	if favoriteUserID != "" {
+		conditions = append(conditions, `EXISTS (SELECT 1 FROM favorite_items f WHERE f.item_type = items.type AND f.item_id = items.id AND f.user_id = ?)`)
+		args = append(args, favoriteUserID)
 	}
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
@@ -848,6 +1115,9 @@ func scanStoredItem(scanner itemScanner) (storedItem, error) {
 }
 
 func (s *Store) hydrateItems(ctx context.Context, items []storedItem, onlyType ItemType, viewerUserID string, publicOnly bool) error {
+	if err := s.loadCreatorProfilesForItems(ctx, items); err != nil {
+		return err
+	}
 	if err := s.loadTagsForItems(ctx, items, onlyType, publicOnly); err != nil {
 		return err
 	}
@@ -861,6 +1131,53 @@ func (s *Store) hydrateItems(ctx context.Context, items []storedItem, onlyType I
 		return err
 	}
 	return s.loadStatsForItems(ctx, items, onlyType, viewerUserID, publicOnly)
+}
+
+func (s *Store) loadCreatorProfilesForItems(ctx context.Context, items []storedItem) error {
+	creatorIDs := make([]string, 0, len(items))
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		if item.CreatorID == "" {
+			continue
+		}
+		if _, ok := seen[item.CreatorID]; ok {
+			continue
+		}
+		seen[item.CreatorID] = struct{}{}
+		creatorIDs = append(creatorIDs, item.CreatorID)
+	}
+	if len(creatorIDs) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(creatorIDs)), ",")
+	args := make([]any, len(creatorIDs))
+	for index, creatorID := range creatorIDs {
+		args[index] = creatorID
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, display_name, username FROM users WHERE id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type creatorProfile struct{ name, username string }
+	profiles := map[string]creatorProfile{}
+	for rows.Next() {
+		var id, name, username string
+		if err := rows.Scan(&id, &name, &username); err != nil {
+			return err
+		}
+		profiles[id] = creatorProfile{name: name, username: username}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for index := range items {
+		if profile, ok := profiles[items[index].CreatorID]; ok {
+			items[index].CreatorName = profile.name
+			items[index].CreatorUsername = profile.username
+		}
+	}
+	return nil
 }
 
 func (s *Store) GetADPYAML(ctx context.Context, itemType ItemType, id, version string) (string, error) {
@@ -1645,6 +1962,12 @@ func normalizeItemType(value string) (ItemType, error) {
 }
 
 func itemAuthor(item storedItem) string {
+	if name := strings.TrimSpace(item.CreatorName); name != "" {
+		return name
+	}
+	if username := strings.TrimSpace(item.CreatorUsername); username != "" {
+		return username
+	}
 	if item.Metadata == nil {
 		return ""
 	}

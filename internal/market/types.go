@@ -22,6 +22,17 @@ type Config struct {
 	SSOJWTPublicKeyFile string
 	SSOJWTPublicKeyPEM  string
 	SSOJWTAudience      string
+	OIDCIssuer          string
+	OIDCClientID        string
+	OIDCClientSecret    string
+	OIDCRedirectURL     string
+	OIDCSessionSecret   string
+	OIDCScopes          string
+	OIDCRoleClaim       string
+	OIDCAdminRole       string
+	OIDCSuccessRedirect string
+	OIDCDebugClaims     bool
+	EnableLocalAuth     bool
 	MaxUploadBytes      int64
 }
 
@@ -335,6 +346,8 @@ type storedItem struct {
 	SandboxKind       string
 	WebsiteKind       string
 	CreatorID         string
+	CreatorName       string
+	CreatorUsername   string
 	Published         bool
 	PublishedAt       time.Time
 	UpdatedAt         time.Time

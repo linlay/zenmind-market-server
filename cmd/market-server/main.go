@@ -42,6 +42,17 @@ func main() {
 		SSOJWTPublicKeyFile: envString("SSO_JWT_PUBLIC_KEY_FILE", defaultSSOJWTPublicKeyFile),
 		SSOJWTPublicKeyPEM:  strings.TrimSpace(os.Getenv("SSO_JWT_PUBLIC_KEY_PEM")),
 		SSOJWTAudience:      envString("SSO_JWT_AUDIENCE", "zenmind-market-server"),
+		OIDCIssuer:          strings.TrimSpace(os.Getenv("MARKET_OIDC_ISSUER")),
+		OIDCClientID:        strings.TrimSpace(os.Getenv("MARKET_OIDC_CLIENT_ID")),
+		OIDCClientSecret:    strings.TrimSpace(os.Getenv("MARKET_OIDC_CLIENT_SECRET")),
+		OIDCRedirectURL:     strings.TrimSpace(os.Getenv("MARKET_OIDC_REDIRECT_URL")),
+		OIDCSessionSecret:   strings.TrimSpace(os.Getenv("MARKET_OIDC_SESSION_SECRET")),
+		OIDCScopes:          envString("MARKET_OIDC_SCOPES", "openid profile email"),
+		OIDCRoleClaim:       envString("MARKET_OIDC_ROLE_CLAIM", "roles"),
+		OIDCAdminRole:       envString("MARKET_OIDC_ADMIN_ROLE", "market-admin"),
+		OIDCSuccessRedirect: envString("MARKET_OIDC_SUCCESS_REDIRECT", "/"),
+		OIDCDebugClaims:     envBool("MARKET_OIDC_DEBUG_CLAIMS", false),
+		EnableLocalAuth:     envBool("MARKET_ENABLE_LOCAL_AUTH", false),
 		MaxUploadBytes:      envInt64("MARKET_MAX_UPLOAD_BYTES", 512*1024*1024),
 	}
 
@@ -111,6 +122,18 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(value)
 	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func envBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
 		return fallback
 	}
 	return parsed

@@ -22,6 +22,18 @@ Public catalog and component list APIs are readable without a token, including `
 
 The market website auth flow is unchanged: it can continue to sit behind the official-site session flow or authentik gateway. Admin APIs keep accepting `Authorization: Bearer $MARKET_ADMIN_TOKEN` and trusted official proxy headers with `X-ZenMind-Market-Proxy-Token: $MARKET_PROXY_TOKEN`; they also accept official-site SSO JWTs with `role=admin` and `scope` containing `market`.
 
+## OIDC login
+
+Market can also act as an OIDC confidential client. Configure `MARKET_OIDC_ISSUER`, client credentials, and a high-entropy `MARKET_OIDC_SESSION_SECRET`; the server discovers provider endpoints and signing keys through OIDC Discovery. Register this exact callback URL with the identity provider:
+
+```text
+https://market.example.com/api/v1/auth/oidc/callback
+```
+
+Browser login starts at `GET /api/v1/auth/oidc/login`; after a successful callback Market stores only a signed, short-lived session cookie and redirects to `MARKET_OIDC_SUCCESS_REDIRECT`. It uses authorization-code flow with PKCE, validates the ID Token issuer, audience, signature and nonce, and maps the configured admin group/role to Market admin access. The default role for another authenticated OIDC user is `creator`.
+
+`MARKET_ENABLE_LOCAL_AUTH` is disabled by default. Enable it only for local development; it exposes an unsigned test-login endpoint and must never be enabled in production.
+
 ## Storage and deployment
 
 The server is the source of truth for market data. The website should read `/api/v1/catalog`; uploaded artifacts should never be baked into the frontend image or copied into the nginx static directory.
