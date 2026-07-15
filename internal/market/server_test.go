@@ -120,6 +120,31 @@ func TestOIDCIdentityClaimsPreferHumanReadableValues(t *testing.T) {
 	}
 }
 
+func TestOIDCAdminUserIDsGrantAdminRole(t *testing.T) {
+	if !oidcAdminUserID(map[string]any{"staffno": "129943", "roles": []any{}}, "129943, fallback-subject") {
+		t.Fatal("staff number should be allowed")
+	}
+	if !oidcAdminUserID(map[string]any{"sub": "fallback-subject"}, "129943, fallback-subject") {
+		t.Fatal("subject should be allowed")
+	}
+	if oidcAdminUserID(map[string]any{"staffno": "other-user"}, "129943, fallback-subject") {
+		t.Fatal("unknown account should not be allowed")
+	}
+}
+
+func TestNormalizePublishADPAllowsMissingManifest(t *testing.T) {
+	app := newTestApp(t)
+	for _, itemType := range []ItemType{TypeSkill, TypeCLITool} {
+		req := PublishRequest{Type: itemType, ID: "optional-adp", Version: "1.0.0"}
+		if err := normalizePublishADP(context.Background(), app.store, "http://market.test", &req, nil); err != nil {
+			t.Fatalf("normalizePublishADP(%s) error = %v", itemType, err)
+		}
+		if req.ADPYAML != "" {
+			t.Fatalf("normalizePublishADP(%s) adpYaml = %q, want empty", itemType, req.ADPYAML)
+		}
+	}
+}
+
 func TestRedactedOIDCClaimsRemovesSensitiveValues(t *testing.T) {
 	claims := redactedOIDCClaims(map[string]any{
 		"sub":            "user-123",
@@ -413,6 +438,7 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/demo/resolve?platform=darwin-arm64", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
@@ -427,6 +453,7 @@ func TestPublishSkillAndPublicAPIs(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/demo/download", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusFound || rec.Header().Get("Location") == "" {
 		t.Fatalf("download status = %d location=%q body=%s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
@@ -521,7 +548,6 @@ func TestPublicMarketResponsesDoNotExposeReviewFields(t *testing.T) {
 		"/api/v1/skills",
 		"/api/v1/skills/public-review-demo",
 		"/api/v1/skills/public-review-demo/versions",
-		"/api/v1/skills/public-review-demo/resolve",
 	} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -610,6 +636,7 @@ func TestPublishSkillPackageProfile(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/office-pack/package/download", nil)
+	authorizeMarketRequest(t, handler, req)
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -656,8 +683,12 @@ func TestPublicReadEndpointsRemainAnonymous(t *testing.T) {
 		{path: "/api/v1/skills", wantStatus: http.StatusOK},
 		{path: "/api/v1/skills/anonymous-demo", wantStatus: http.StatusOK},
 		{path: "/api/v1/skills/anonymous-demo/versions", wantStatus: http.StatusOK},
-		{path: "/api/v1/skills/anonymous-demo/resolve", wantStatus: http.StatusOK},
-		{path: "/api/v1/skills/anonymous-demo/download", wantStatus: http.StatusFound},
+		{path: "/api/v1/skills/anonymous-demo/resolve", wantStatus: http.StatusUnauthorized},
+		{path: "/api/v1/skills/anonymous-demo/download", wantStatus: http.StatusUnauthorized},
+		{path: "/api/v1/skills/anonymous-demo/package/download", wantStatus: http.StatusUnauthorized},
+		{path: "/api/v1/adp/skill/anonymous-demo", wantStatus: http.StatusUnauthorized},
+		{path: "/npm/@zenmind-skill/anonymous-demo", wantStatus: http.StatusUnauthorized},
+		{path: "/artifacts/skill/anonymous-demo/1.0.0/artifact.zip", wantStatus: http.StatusUnauthorized},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()
@@ -723,6 +754,7 @@ func TestVersionCanonicalizationAtAPIBoundaries(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/plugins/calendar/resolve?version=v1.0.0", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
@@ -737,6 +769,7 @@ func TestVersionCanonicalizationAtAPIBoundaries(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/plugins/calendar/download?version=V1.0.0", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusFound {
 		t.Fatalf("download status = %d body=%s", rec.Code, rec.Body.String())
@@ -889,6 +922,7 @@ func TestPublicItemStatsAndDownloadCount(t *testing.T) {
 	for _, version := range []string{"1.0.0", "2.0.0"} {
 		rec = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/stats/download?version="+version, nil)
+		authorizeMarketRequest(t, handler, req)
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusFound || rec.Header().Get("Location") == "" {
 			t.Fatalf("download %s status = %d location=%q body=%s", version, rec.Code, rec.Header().Get("Location"), rec.Body.String())
@@ -911,6 +945,7 @@ func TestPublicItemStatsAndDownloadCount(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/stats/resolve", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
@@ -1470,6 +1505,7 @@ func TestNpmPackument(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/npm/@zenmind-skill/demo", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("npm status = %d body=%s", rec.Code, rec.Body.String())
@@ -1480,6 +1516,7 @@ func TestNpmPackument(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/npm/@zenmind-agent/assistant", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("agent npm status = %d body=%s", rec.Code, rec.Body.String())
@@ -1728,6 +1765,7 @@ func TestEightMarketTypesPublishListResolveAndDownload(t *testing.T) {
 
 		rec = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodGet, "/api/v1/"+fixture.path+"/"+fixture.id+"/resolve?platform=darwin-arm64", nil)
+		authorizeMarketRequest(t, handler, req)
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("resolve %s status = %d body=%s", fixture.path, rec.Code, rec.Body.String())
@@ -1745,6 +1783,7 @@ func TestEightMarketTypesPublishListResolveAndDownload(t *testing.T) {
 
 		rec = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodGet, "/api/v1/"+fixture.path+"/"+fixture.id+"/download", nil)
+		authorizeMarketRequest(t, handler, req)
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusFound || rec.Header().Get("Location") == "" {
 			t.Fatalf("download %s status = %d location=%q body=%s", fixture.path, rec.Code, rec.Header().Get("Location"), rec.Body.String())
@@ -1753,6 +1792,7 @@ func TestEightMarketTypesPublishListResolveAndDownload(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/website-apps/docs/resolve", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("legacy website-apps resolve status = %d body=%s", rec.Code, rec.Body.String())
@@ -1882,6 +1922,7 @@ func TestVersionPlatformsCarryPlatformSpecificProtocol(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/cli-tools/zmctl/resolve?platform=darwin-arm64", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
@@ -1933,6 +1974,7 @@ func TestResolvePlatformSpecFallsBackWithoutArtifact(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/cli-tools/json-cli/resolve?platform=linux-amd64-apt", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
@@ -2072,6 +2114,7 @@ func TestContainerImageArtifactAcceptsTarGzAlias(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/sandbox-images/runtime-image/resolve?platform=darwin-arm64", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("resolve status = %d body=%s", rec.Code, rec.Body.String())
@@ -2172,6 +2215,7 @@ func TestADPManifestPublishNormalizeAndEndpoint(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/adp/cli-tool/zmctl?version=1.0.0", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("adp status = %d body=%s", rec.Code, rec.Body.String())
@@ -2213,6 +2257,7 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 	}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo/resolve?version=2.0.0", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	var latest ResolveResponse
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &latest) != nil || latest.Asset == nil {
@@ -2221,6 +2266,7 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 	directArtifactPath := strings.TrimPrefix(latest.Asset.URL, "http://market.test")
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, directArtifactPath, nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("published artifact status=%d body=%s", rec.Code, rec.Body.String())
@@ -2257,6 +2303,7 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo/resolve", nil)
+	authorizeMarketRequest(t, handler, req)
 	handler.ServeHTTP(rec, req)
 	var resolved ResolveResponse
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &resolved) != nil || resolved.Version != "1.10.0" || resolved.Asset == nil {
@@ -2271,6 +2318,7 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 	} {
 		rec = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodGet, endpoint, nil)
+		authorizeMarketRequest(t, handler, req)
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("unpublished endpoint %s status = %d, want 404: %s", endpoint, rec.Code, rec.Body.String())
@@ -2447,6 +2495,11 @@ func loginLocalUser(t *testing.T, handler http.Handler, userID, role string) str
 		t.Fatalf("local login response = %+v", response)
 	}
 	return response.Token
+}
+
+func authorizeMarketRequest(t *testing.T, handler http.Handler, req *http.Request) {
+	t.Helper()
+	req.Header.Set("Authorization", "Bearer "+loginLocalUser(t, handler, "download-user", "creator"))
 }
 
 func setProxyUser(req *http.Request, userID string) {

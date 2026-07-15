@@ -28,8 +28,7 @@ type Config struct {
 	OIDCRedirectURL     string
 	OIDCSessionSecret   string
 	OIDCScopes          string
-	OIDCRoleClaim       string
-	OIDCAdminRole       string
+	OIDCAdminUserIDs    string
 	OIDCSuccessRedirect string
 	OIDCDebugClaims     bool
 	EnableLocalAuth     bool

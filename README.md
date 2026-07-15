@@ -30,7 +30,7 @@ Market can also act as an OIDC confidential client. Configure `MARKET_OIDC_ISSUE
 https://market.example.com/api/v1/auth/oidc/callback
 ```
 
-Browser login starts at `GET /api/v1/auth/oidc/login`; after a successful callback Market stores only a signed, short-lived session cookie and redirects to `MARKET_OIDC_SUCCESS_REDIRECT`. It uses authorization-code flow with PKCE, validates the ID Token issuer, audience, signature and nonce, and maps the configured admin group/role to Market admin access. The default role for another authenticated OIDC user is `creator`.
+Browser login starts at `GET /api/v1/auth/oidc/login`; after a successful callback Market stores only a signed, short-lived session cookie and redirects to `MARKET_OIDC_SUCCESS_REDIRECT`. It uses authorization-code flow with PKCE and validates the ID Token issuer, audience, signature and nonce. `MARKET_OIDC_ADMIN_USER_IDS` is a comma-separated allowlist of `staffno` or `sub` values that receive Market admin access. The default role for another authenticated OIDC user is `creator`.
 
 `MARKET_ENABLE_LOCAL_AUTH` is disabled by default. Enable it only for local development; it exposes an unsigned test-login endpoint and must never be enabled in production.
 
@@ -38,7 +38,7 @@ Browser login starts at `GET /api/v1/auth/oidc/login`; after a successful callba
 
 The server is the source of truth for market data. The website should read `/api/v1/catalog`; uploaded artifacts should never be baked into the frontend image or copied into the nginx static directory.
 
-CLI tools and skills require an ADP `schema: "0.1"` manifest at publish time. The server validates the latest hook protocol (`exec`, `sh`, `pwsh`, `cmd` runners), rejects legacy hook syntax, and binds uploaded artifact URLs plus SHA-256 values into the stored `adp.yaml`.
+CLI tools and skills may include an ADP `schema: "0.1"` manifest when they need extra dependency installation. When supplied, the server validates the latest hook protocol (`exec`, `sh`, `pwsh`, `cmd` runners), rejects legacy hook syntax, and binds uploaded artifact URLs plus SHA-256 values into the stored `adp.yaml`.
 
 In local-storage container deployments, keep SQLite and artifacts in the same persistent backend volume:
 

@@ -83,7 +83,7 @@ func normalizePublishADP(ctx context.Context, store *Store, publicBaseURL string
 		return nil
 	}
 	if strings.TrimSpace(req.ADPYAML) == "" {
-		return fmt.Errorf("%s publish requires adp.yaml", req.Type)
+		return nil
 	}
 	current, err := parseADPDocument(req.ADPYAML)
 	if err != nil {

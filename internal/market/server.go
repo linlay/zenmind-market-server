@@ -421,6 +421,9 @@ func (a *App) handleMarketVersions(w http.ResponseWriter, r *http.Request, itemT
 }
 
 func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	if _, ok := a.authorizedMarketUser(w, r); !ok {
+		return
+	}
 	id := sanitizeSlug(r.PathValue("id"))
 	item, err := a.store.GetPublic(r.Context(), itemType, id, a.viewerUserID(r))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -479,10 +482,16 @@ func (a *App) handleMarketResolve(w http.ResponseWriter, r *http.Request, itemTy
 }
 
 func (a *App) handleMarketDownload(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	if _, ok := a.authorizedMarketUser(w, r); !ok {
+		return
+	}
 	a.downloadArtifact(w, r, itemType, sanitizeSlug(r.PathValue("id")), r.URL.Query().Get("version"), r.URL.Query().Get("platform"))
 }
 
 func (a *App) handleSkillPackageDownload(w http.ResponseWriter, r *http.Request) {
+	if _, ok := a.authorizedMarketUser(w, r); !ok {
+		return
+	}
 	id := sanitizeSlug(r.PathValue("id"))
 	item, err := a.store.GetPublic(r.Context(), TypeSkill, id, a.viewerUserID(r))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -713,6 +722,9 @@ func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, f
 }
 
 func (a *App) handleADPManifest(w http.ResponseWriter, r *http.Request) {
+	if _, ok := a.authorizedMarketUser(w, r); !ok {
+		return
+	}
 	itemType, err := normalizeItemType(r.PathValue("type"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
@@ -787,6 +799,9 @@ func (a *App) handleNPM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
+	if _, ok := a.authorizedMarketUser(w, r); !ok {
+		return
+	}
 	rawName := strings.TrimPrefix(r.URL.Path, "/npm/")
 	name, _ := url.PathUnescape(rawName)
 	itemType, id, err := parseNpmPackageName(name)
@@ -814,6 +829,9 @@ func (a *App) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !strings.HasPrefix(relative, "media/") {
+		if _, ok := a.authorizedMarketUser(w, r); !ok {
+			return
+		}
 		if err := a.store.EnsurePublishedArtifactPath(r.Context(), objectID); errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "not_found", "artifact not found")
 			return

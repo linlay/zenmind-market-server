@@ -162,7 +162,7 @@ func (a *App) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 			ProviderAccount:  stringClaim(claims, "oaAccount"),
 			ExternalUserID:   stringClaim(claims, "userId"),
 			StaffNumber:      stringClaim(claims, "staffno"),
-			IsAdmin:          oidcRole(claims, a.cfg) == "admin",
+			IsAdmin:          oidcAdminUserID(claims, a.cfg.OIDCAdminUserIDs),
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "store_error", err.Error())
@@ -326,31 +326,25 @@ func sensitiveOIDCClaim(key string) bool {
 		return false
 	}
 }
-func oidcRole(claims map[string]any, cfg Config) string {
-	want := strings.TrimSpace(cfg.OIDCAdminRole)
-	if want != "" {
-		for _, value := range claimStrings(claims[cfg.OIDCRoleClaim]) {
-			if value == want {
-				return "admin"
-			}
+func oidcAdminUserID(claims map[string]any, configuredIDs string) bool {
+	allowed := map[string]struct{}{}
+	for _, value := range strings.FieldsFunc(configuredIDs, func(char rune) bool {
+		return char == ',' || char == ';' || char == '\n' || char == '\r' || char == '\t' || char == ' '
+	}) {
+		allowed[strings.TrimSpace(value)] = struct{}{}
+	}
+	if len(allowed) == 0 {
+		return false
+	}
+	for _, accountID := range []string{stringClaim(claims, "staffno"), stringClaim(claims, "sub")} {
+		if accountID == "" {
+			continue
+		}
+		if _, ok := allowed[accountID]; ok {
+			return true
 		}
 	}
-	return "creator"
-}
-func claimStrings(value any) []string {
-	switch v := value.(type) {
-	case string:
-		return strings.Fields(v)
-	case []any:
-		result := make([]string, 0, len(v))
-		for _, item := range v {
-			if value, ok := item.(string); ok {
-				result = append(result, value)
-			}
-		}
-		return result
-	}
-	return nil
+	return false
 }
 func containsString(values []string, want string) bool {
 	for _, value := range values {
