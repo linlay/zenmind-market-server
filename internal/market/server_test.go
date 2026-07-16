@@ -37,13 +37,12 @@ func newTestAppWithConfig(t *testing.T, override Config) *App {
 	t.Helper()
 	root := t.TempDir()
 	cfg := Config{
-		DatabasePath:    filepath.Join(root, "market.db"),
-		ArtifactRoot:    filepath.Join(root, "artifacts"),
-		PublicBaseURL:   "http://market.test",
-		AdminToken:      "secret",
-		ProxyToken:      "proxy-secret",
-		MaxUploadBytes:  10 * 1024 * 1024,
-		EnableLocalAuth: true,
+		DatabasePath:   filepath.Join(root, "market.db"),
+		ArtifactRoot:   filepath.Join(root, "artifacts"),
+		PublicBaseURL:  "http://market.test",
+		AdminToken:     "secret",
+		ProxyToken:     "proxy-secret",
+		MaxUploadBytes: 10 * 1024 * 1024,
 	}
 	if override.SSOJWTIssuer != "" {
 		cfg.SSOJWTIssuer = override.SSOJWTIssuer
@@ -1192,7 +1191,7 @@ func TestFavoriteItemsUseSSOJWTUser(t *testing.T) {
 	}
 }
 
-func TestLocalLoginSeparatesCreatorAndAdminReviewAccess(t *testing.T) {
+func TestTrustedProxySeparatesCreatorAndAdminReviewAccess(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
 	publishMultipart(t, handler, PublishRequest{
@@ -1212,7 +1211,6 @@ func TestLocalLoginSeparatesCreatorAndAdminReviewAccess(t *testing.T) {
 		ReviewStatus: ReviewStatusRejected,
 	}, zipArchive(t, map[string]string{"rejected-demo/SKILL.md": "# Rejected\n"}))
 
-	creatorToken := loginLocalUser(t, handler, "creator-a", "creator")
 	rawPublish, _ := json.Marshal(PublishRequest{
 		Type:         TypeWebsiteApp,
 		ID:           "creator-submitted",
@@ -1224,13 +1222,12 @@ func TestLocalLoginSeparatesCreatorAndAdminReviewAccess(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/creator/publish", bytes.NewReader(rawPublish))
-	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	setProxyUser(req, "creator-a")
 	req.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("creator publish status = %d body=%s", rec.Code, rec.Body.String())
 	}
-	otherCreatorToken := loginLocalUser(t, handler, "creator-b", "creator")
 	otherRawPublish, _ := json.Marshal(PublishRequest{
 		Type:        TypeWebsiteApp,
 		ID:          "other-submitted",
@@ -1241,7 +1238,7 @@ func TestLocalLoginSeparatesCreatorAndAdminReviewAccess(t *testing.T) {
 	})
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/creator/publish", bytes.NewReader(otherRawPublish))
-	req.Header.Set("Authorization", "Bearer "+otherCreatorToken)
+	setProxyUser(req, "creator-b")
 	req.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -1250,7 +1247,7 @@ func TestLocalLoginSeparatesCreatorAndAdminReviewAccess(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/creator/items", nil)
-	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	setProxyUser(req, "creator-a")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("creator items status = %d body=%s", rec.Code, rec.Body.String())
@@ -1272,16 +1269,15 @@ func TestLocalLoginSeparatesCreatorAndAdminReviewAccess(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/reviews", nil)
-	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	setProxyUser(req, "creator-a")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("creator admin reviews status = %d, want 403 body=%s", rec.Code, rec.Body.String())
 	}
 
-	adminToken := loginLocalUser(t, handler, "admin-a", "admin")
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/reviews?status=pending", nil)
-	req.Header.Set("Authorization", "Bearer "+adminToken)
+	setProxyUserWithRole(req, "admin-a", "admin")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin reviews status = %d body=%s", rec.Code, rec.Body.String())
@@ -1301,7 +1297,7 @@ func TestLocalLoginSeparatesCreatorAndAdminReviewAccess(t *testing.T) {
 	rawReview, _ := json.Marshal(map[string]string{"status": ReviewStatusApproved, "reviewedBy": "spoofed-admin"})
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/reviews/skill/pending-demo", bytes.NewReader(rawReview))
-	req.Header.Set("Authorization", "Bearer "+adminToken)
+	setProxyUserWithRole(req, "admin-a", "admin")
 	req.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -1320,7 +1316,6 @@ func TestCreatorItemsUseStoredCreatorID(t *testing.T) {
 	app := newTestApp(t)
 	handler := app.Routes()
 
-	creatorToken := loginLocalUser(t, handler, "creator-owned", "creator")
 	rawPublish, _ := json.Marshal(PublishRequest{
 		Type:        TypeWebsiteApp,
 		ID:          "creator-owned-app",
@@ -1331,7 +1326,7 @@ func TestCreatorItemsUseStoredCreatorID(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/creator/publish", bytes.NewReader(rawPublish))
-	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	setProxyUser(req, "creator-owned")
 	req.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -1352,7 +1347,7 @@ func TestCreatorItemsUseStoredCreatorID(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/creator/items", nil)
-	req.Header.Set("Authorization", "Bearer "+creatorToken)
+	setProxyUser(req, "creator-owned")
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("creator items status = %d body=%s", rec.Code, rec.Body.String())
@@ -2503,40 +2498,19 @@ func favoriteRequest(t *testing.T, handler http.Handler, method, path, userID st
 	return item
 }
 
-func loginLocalUser(t *testing.T, handler http.Handler, userID, role string) string {
-	t.Helper()
-	raw, _ := json.Marshal(map[string]string{"userId": userID, "role": role})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("local login status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var response struct {
-		Token string `json:"token"`
-		User  struct {
-			ID   string `json:"id"`
-			Role string `json:"role"`
-		} `json:"user"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("decode local login: %v", err)
-	}
-	if response.Token == "" || response.User.ID != userID || response.User.Role != role {
-		t.Fatalf("local login response = %+v", response)
-	}
-	return response.Token
-}
-
 func authorizeMarketRequest(t *testing.T, handler http.Handler, req *http.Request) {
 	t.Helper()
-	req.Header.Set("Authorization", "Bearer "+loginLocalUser(t, handler, "download-user", "creator"))
+	setProxyUser(req, "download-user")
 }
 
 func setProxyUser(req *http.Request, userID string) {
+	setProxyUserWithRole(req, userID, "creator")
+}
+
+func setProxyUserWithRole(req *http.Request, userID, role string) {
 	req.Header.Set("X-ZenMind-Market-Proxy-Token", "proxy-secret")
 	req.Header.Set("X-ZenMind-User-ID", userID)
+	req.Header.Set("X-ZenMind-User-Role", role)
 }
 
 type testSSOJWTClaims struct {

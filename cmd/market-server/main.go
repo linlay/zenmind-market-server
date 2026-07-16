@@ -53,7 +53,6 @@ func main() {
 		OIDCLogoutURL:       strings.TrimSpace(os.Getenv("MARKET_OIDC_LOGOUT_URL")),
 		OIDCLogoutCallback:  strings.TrimSpace(os.Getenv("MARKET_OIDC_LOGOUT_CALLBACK")),
 		OIDCDebugClaims:     envBool("MARKET_OIDC_DEBUG_CLAIMS", false),
-		EnableLocalAuth:     envBool("MARKET_ENABLE_LOCAL_AUTH", false),
 		MaxUploadBytes:      envInt64("MARKET_MAX_UPLOAD_BYTES", 512*1024*1024),
 	}
 

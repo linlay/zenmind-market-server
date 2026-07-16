@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,9 +84,6 @@ func (a *App) Close() error {
 func (a *App) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.handleHealth)
-	if a.cfg.EnableLocalAuth {
-		mux.HandleFunc("POST /api/v1/auth/login", a.handleLocalLogin)
-	}
 	mux.HandleFunc("GET /api/v1/auth/me", a.handleAuthMe)
 	mux.HandleFunc("GET /api/v1/me/favorites", a.handleMyFavorites)
 	mux.HandleFunc("GET /api/v1/auth/oidc/login", a.handleOIDCLogin)
@@ -162,48 +158,21 @@ func (a *App) handleMarkets(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, MarketsResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC(), Markets: marketInfos()})
 }
 
-func (a *App) handleLocalLogin(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		UserID string `json:"userId"`
-		Name   string `json:"name"`
-		Role   string `json:"role"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1024*1024)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
-		return
-	}
-	userID := sanitizeSlug(req.UserID)
-	if userID == "" {
-		userID = "local-creator"
-	}
-	role := normalizeLocalRole(req.Role)
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		name = userID
-	}
-	user := localUser{ID: userID, Name: name, Role: role}
-	writeJSON(w, http.StatusOK, map[string]any{"token": encodeLocalUserToken(user), "user": user})
-}
-
 func (a *App) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	if user, ok := a.oidcUserFromRequest(r); ok {
-		writeJSON(w, http.StatusOK, map[string]any{"user": user})
-		return
-	}
-	if user, ok := a.localUserFromRequest(r); ok {
 		writeJSON(w, http.StatusOK, map[string]any{"user": user})
 		return
 	}
 	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
 		userID := strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
 		if userID != "" {
-			role := normalizeLocalRole(r.Header.Get("X-ZenMind-User-Role"))
-			writeJSON(w, http.StatusOK, map[string]any{"user": localUser{ID: userID, Name: userID, Role: role}})
+			role := normalizeUserRole(r.Header.Get("X-ZenMind-User-Role"))
+			writeJSON(w, http.StatusOK, map[string]any{"user": authenticatedUser{ID: userID, Name: userID, Role: role}})
 			return
 		}
 	}
 	if principal, ok := a.ssoJWT.principalFromRequest(r); ok && principal.HasScope("market") {
-		writeJSON(w, http.StatusOK, map[string]any{"user": localUser{ID: principal.UserID, Name: principal.UserID, Role: normalizeLocalRole(principal.Role)}})
+		writeJSON(w, http.StatusOK, map[string]any{"user": authenticatedUser{ID: principal.UserID, Name: principal.UserID, Role: normalizeUserRole(principal.Role)}})
 		return
 	}
 	writeError(w, http.StatusUnauthorized, "unauthorized", "login required")
@@ -1152,7 +1121,7 @@ type authResult struct {
 	Message string
 }
 
-type localUser struct {
+type authenticatedUser struct {
 	ID       string `json:"id"`
 	Username string `json:"username,omitempty"`
 	Name     string `json:"name"`
@@ -1173,12 +1142,6 @@ func (a *App) authorizedAdmin(r *http.Request) authResult {
 	if a.cfg.AdminToken != "" && strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(auth, "Bearer")), a.cfg.AdminToken) {
 		return allowAuth()
 	}
-	if user, ok := a.localUserFromRequest(r); ok {
-		if user.Role == "admin" {
-			return allowAuth()
-		}
-		return denyAuth(http.StatusForbidden, "forbidden", "admin role required")
-	}
 	if user, ok := a.oidcUserFromRequest(r); ok {
 		if user.Role == "admin" {
 			return allowAuth()
@@ -1190,6 +1153,7 @@ func (a *App) authorizedAdmin(r *http.Request) authResult {
 		if role == "admin" {
 			return allowAuth()
 		}
+		return denyAuth(http.StatusForbidden, "forbidden", "admin role required")
 	}
 	if auth == "" {
 		return denyAuth(http.StatusUnauthorized, "unauthorized", "admin token required")
@@ -1214,9 +1178,6 @@ func (a *App) viewerUserID(r *http.Request) string {
 	if user, ok := a.oidcUserFromRequest(r); ok {
 		return user.ID
 	}
-	if user, ok := a.localUserFromRequest(r); ok {
-		return user.ID
-	}
 	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
 		return strings.TrimSpace(r.Header.Get("X-ZenMind-User-ID"))
 	}
@@ -1228,9 +1189,6 @@ func (a *App) viewerUserID(r *http.Request) string {
 
 func (a *App) reviewerID(r *http.Request) string {
 	if user, ok := a.oidcUserFromRequest(r); ok {
-		return user.ID
-	}
-	if user, ok := a.localUserFromRequest(r); ok {
 		return user.ID
 	}
 	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
@@ -1247,9 +1205,6 @@ func (a *App) reviewerID(r *http.Request) string {
 
 func (a *App) authorizedMarketUser(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if user, ok := a.oidcUserFromRequest(r); ok {
-		return user.ID, true
-	}
-	if user, ok := a.localUserFromRequest(r); ok {
 		return user.ID, true
 	}
 	if a.cfg.ProxyToken != "" && r.Header.Get("X-ZenMind-Market-Proxy-Token") == a.cfg.ProxyToken {
@@ -1278,43 +1233,7 @@ func (a *App) authorizedMarketUser(w http.ResponseWriter, r *http.Request) (stri
 	return principal.UserID, true
 }
 
-func (a *App) localUserFromRequest(r *http.Request) (localUser, bool) {
-	if !a.cfg.EnableLocalAuth {
-		return localUser{}, false
-	}
-	return decodeLocalUserToken(bearerToken(r.Header.Get("Authorization")))
-}
-
-func encodeLocalUserToken(user localUser) string {
-	raw, _ := json.Marshal(user)
-	return "local." + base64.RawURLEncoding.EncodeToString(raw)
-}
-
-func decodeLocalUserToken(token string) (localUser, bool) {
-	if !strings.HasPrefix(token, "local.") {
-		return localUser{}, false
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(token, "local."))
-	if err != nil {
-		return localUser{}, false
-	}
-	var user localUser
-	if err := json.Unmarshal(raw, &user); err != nil {
-		return localUser{}, false
-	}
-	user.ID = strings.TrimSpace(user.ID)
-	user.Role = normalizeLocalRole(user.Role)
-	user.Name = strings.TrimSpace(user.Name)
-	if user.ID == "" {
-		return localUser{}, false
-	}
-	if user.Name == "" {
-		user.Name = user.ID
-	}
-	return user, true
-}
-
-func normalizeLocalRole(role string) string {
+func normalizeUserRole(role string) string {
 	switch strings.ToLower(strings.TrimSpace(role)) {
 	case "admin", "administrator":
 		return "admin"

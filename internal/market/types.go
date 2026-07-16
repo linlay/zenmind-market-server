@@ -33,7 +33,6 @@ type Config struct {
 	OIDCLogoutURL       string
 	OIDCLogoutCallback  string
 	OIDCDebugClaims     bool
-	EnableLocalAuth     bool
 	MaxUploadBytes      int64
 }
 

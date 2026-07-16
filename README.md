@@ -34,8 +34,6 @@ Browser login starts at `GET /api/v1/auth/oidc/login`; after a successful callba
 
 Browser logout navigates to `GET /api/v1/auth/oidc/logout`. Market clears its local session cookie and, when `MARKET_OIDC_LOGOUT_URL` is configured, redirects to that IAM endpoint with `MARKET_OIDC_LOGOUT_CALLBACK` as the required `callback` query parameter. The callback must be an absolute HTTP(S) URL no longer than 128 characters.
 
-`MARKET_ENABLE_LOCAL_AUTH` is disabled by default. Enable it only for local development; it exposes an unsigned test-login endpoint and must never be enabled in production.
-
 ## Storage and deployment
 
 The server is the source of truth for market data. The website should read `/api/v1/catalog`; uploaded artifacts should never be baked into the frontend image or copied into the nginx static directory.

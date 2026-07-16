@@ -226,24 +226,24 @@ func oidcLogoutURL(cfg Config) (string, error) {
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil
 }
-func (a *App) oidcUserFromRequest(r *http.Request) (localUser, bool) {
+func (a *App) oidcUserFromRequest(r *http.Request) (authenticatedUser, bool) {
 	client := a.currentOIDCClient()
 	if client == nil {
-		return localUser{}, false
+		return authenticatedUser{}, false
 	}
 	cookie, err := r.Cookie(oidcSessionCookie)
 	if err != nil {
-		return localUser{}, false
+		return authenticatedUser{}, false
 	}
 	var session oidcSession
 	if client.verify(cookie.Value, &session) != nil || session.ExpiresAt <= time.Now().Unix() || session.UserID == "" {
-		return localUser{}, false
+		return authenticatedUser{}, false
 	}
 	user, err := a.store.GetMarketUser(r.Context(), session.UserID)
 	if err != nil || user.Status != "active" {
-		return localUser{}, false
+		return authenticatedUser{}, false
 	}
-	return localUser{ID: user.ID, Username: user.Username, Name: user.DisplayName, Email: user.Email, Role: user.Role}, true
+	return authenticatedUser{ID: user.ID, Username: user.Username, Name: user.DisplayName, Email: user.Email, Role: user.Role}, true
 }
 func (a *App) readOIDCState(client *oidcClient, r *http.Request) (oidcState, error) {
 	cookie, err := r.Cookie(oidcStateCookie)
