@@ -184,7 +184,47 @@ func (a *App) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleOIDCLogout(w http.ResponseWriter, r *http.Request) {
 	a.setOIDCCookie(w, oidcSessionCookie, "", -1)
+	a.setOIDCCookie(w, oidcStateCookie, "", -1)
+	if r.Method == http.MethodGet {
+		logoutURL, err := oidcLogoutURL(a.cfg)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "oidc_logout_config_error", err.Error())
+			return
+		}
+		if logoutURL != "" {
+			http.Redirect(w, r, logoutURL, http.StatusFound)
+			return
+		}
+		http.Redirect(w, r, safeOIDCRedirect(a.cfg.OIDCSuccessRedirect), http.StatusFound)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func oidcLogoutURL(cfg Config) (string, error) {
+	rawEndpoint := strings.TrimSpace(cfg.OIDCLogoutURL)
+	if rawEndpoint == "" {
+		return "", nil
+	}
+	endpoint, err := url.Parse(rawEndpoint)
+	if err != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.Host == "" {
+		return "", errors.New("MARKET_OIDC_LOGOUT_URL must be an absolute HTTP(S) URL")
+	}
+	callback := strings.TrimSpace(cfg.OIDCLogoutCallback)
+	if callback == "" {
+		callback = strings.TrimRight(cfg.PublicBaseURL, "/") + "/"
+	}
+	if len(callback) > 128 {
+		return "", errors.New("MARKET_OIDC_LOGOUT_CALLBACK must not exceed 128 characters")
+	}
+	parsedCallback, err := url.Parse(callback)
+	if err != nil || (parsedCallback.Scheme != "http" && parsedCallback.Scheme != "https") || parsedCallback.Host == "" {
+		return "", errors.New("MARKET_OIDC_LOGOUT_CALLBACK must be an absolute HTTP(S) URL")
+	}
+	query := endpoint.Query()
+	query.Set("callback", callback)
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String(), nil
 }
 func (a *App) oidcUserFromRequest(r *http.Request) (localUser, bool) {
 	client := a.currentOIDCClient()

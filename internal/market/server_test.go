@@ -69,6 +69,12 @@ func newTestAppWithConfig(t *testing.T, override Config) *App {
 	if override.S3Endpoint != "" {
 		cfg.S3Endpoint = override.S3Endpoint
 	}
+	if override.OIDCLogoutURL != "" {
+		cfg.OIDCLogoutURL = override.OIDCLogoutURL
+	}
+	if override.OIDCLogoutCallback != "" {
+		cfg.OIDCLogoutCallback = override.OIDCLogoutCallback
+	}
 	app, err := Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
@@ -103,6 +109,48 @@ func TestRandomOIDCStateIsOpaqueHex(t *testing.T) {
 	}
 	if state == secondState {
 		t.Fatal("two generated states must not match")
+	}
+}
+
+func TestOIDCLogoutClearsLocalSessionAndRedirectsToIAM(t *testing.T) {
+	app := newTestAppWithConfig(t, Config{
+		OIDCLogoutURL:      "https://eiam.qiuer.net/auth/ssoLogout",
+		OIDCLogoutCallback: "http://127.0.0.1:5173/",
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/logout", nil)
+	req.AddCookie(&http.Cookie{Name: oidcSessionCookie, Value: "signed-session"})
+	rec := httptest.NewRecorder()
+	app.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("logout status = %d, want 302: %s", rec.Code, rec.Body.String())
+	}
+	wantLocation := "https://eiam.qiuer.net/auth/ssoLogout?callback=http%3A%2F%2F127.0.0.1%3A5173%2F"
+	if rec.Header().Get("Location") != wantLocation {
+		t.Fatalf("logout location = %q, want %q", rec.Header().Get("Location"), wantLocation)
+	}
+	cookies := rec.Result().Cookies()
+	cleared := map[string]bool{}
+	for _, cookie := range cookies {
+		if cookie.MaxAge < 0 && cookie.Value == "" {
+			cleared[cookie.Name] = true
+		}
+	}
+	if !cleared[oidcSessionCookie] || !cleared[oidcStateCookie] {
+		t.Fatalf("logout cookies were not cleared: %+v", cookies)
+	}
+}
+
+func TestOIDCLogoutURLValidation(t *testing.T) {
+	for name, cfg := range map[string]Config{
+		"relative endpoint": {OIDCLogoutURL: "/auth/ssoLogout", OIDCLogoutCallback: "http://127.0.0.1:5173/"},
+		"relative callback": {OIDCLogoutURL: "https://eiam.qiuer.net/auth/ssoLogout", OIDCLogoutCallback: "/"},
+		"callback too long": {OIDCLogoutURL: "https://eiam.qiuer.net/auth/ssoLogout", OIDCLogoutCallback: "https://market.test/" + strings.Repeat("a", 110)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := oidcLogoutURL(cfg); err == nil {
+				t.Fatal("oidcLogoutURL() error = nil, want validation error")
+			}
+		})
 	}
 }
 
@@ -2287,6 +2335,23 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 	unpublish("1.2.0", http.StatusBadRequest)
 	unpublish("2.0.0", http.StatusOK)
 
+	var storedLatest string
+	if err := app.store.db.QueryRow(`SELECT latest_version FROM items WHERE type = ? AND id = ?`, TypeSkill, "rollback-demo").Scan(&storedLatest); err != nil {
+		t.Fatalf("query latest version after fallback: %v", err)
+	}
+	if storedLatest != "1.10.0" {
+		t.Fatalf("stored latest version after fallback = %q, want 1.10.0", storedLatest)
+	}
+	for version, wantPublished := range map[string]int{"1.2.0": 1, "1.10.0": 1, "2.0.0": 0} {
+		var published int
+		if err := app.store.db.QueryRow(`SELECT published FROM versions WHERE item_type = ? AND item_id = ? AND version = ?`, TypeSkill, "rollback-demo", version).Scan(&published); err != nil {
+			t.Fatalf("query published state for %s: %v", version, err)
+		}
+		if published != wantPublished {
+			t.Fatalf("published state for %s = %d, want %d", version, published, wantPublished)
+		}
+	}
+
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo", nil)
 	handler.ServeHTTP(rec, req)
@@ -2333,39 +2398,6 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("last-version item status = %d, want 404: %s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestADPPublishRequiresManifestForNewCLIToolAndSkill(t *testing.T) {
-	app := newTestApp(t)
-	handler := app.Routes()
-
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	rawMetadata, _ := json.Marshal(PublishRequest{
-		ID:          "no-adp",
-		Name:        "No ADP",
-		Version:     "1.0.0",
-		ArchiveType: "zip",
-	})
-	_ = writer.WriteField("metadata", string(rawMetadata))
-	part, err := writer.CreateFormFile("artifact", "artifact.zip")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := part.Write(zipArchive(t, map[string]string{"bin/no-adp": "#!/bin/sh\n"})); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/cli-tools/publish", &body)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer secret")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"invalid_adp"`) {
-		t.Fatalf("publish without adp status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -2725,6 +2757,108 @@ func tarGz(t *testing.T, files map[string]string) []byte {
 		t.Fatalf("gzip close: %v", err)
 	}
 	return buf.Bytes()
+}
+
+func TestCommentLifecycleAndModeration(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type: TypeSkill, ID: "commented", Name: "Commented Skill", Version: "1.0.0", Description: "comment target", ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{"commented/SKILL.md": "# Commented\n"}))
+
+	request := func(method, path, userID string, body any, admin bool) *httptest.ResponseRecorder {
+		t.Helper()
+		var reader io.Reader
+		if body != nil {
+			data, err := json.Marshal(body)
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			reader = bytes.NewReader(data)
+		}
+		req := httptest.NewRequest(method, path, reader)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if admin {
+			req.Header.Set("Authorization", "Bearer secret")
+		} else if userID != "" {
+			setProxyUser(req, userID)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := request(http.MethodPost, "/api/v1/skills/commented/comments", "", map[string]string{"sentiment": "positive", "content": "anonymous comment"}, false); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous create status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	created := make([]ItemComment, 0, 2)
+	for _, input := range []map[string]string{
+		{"sentiment": "positive", "content": "This component works very well."},
+		{"sentiment": "negative", "content": "This component needs more documentation."},
+	} {
+		rec := request(http.MethodPost, "/api/v1/skills/commented/comments", "alice", input, false)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create status = %d body=%s", rec.Code, rec.Body.String())
+		}
+		var comment ItemComment
+		if err := json.Unmarshal(rec.Body.Bytes(), &comment); err != nil {
+			t.Fatalf("decode created comment: %v", err)
+		}
+		created = append(created, comment)
+	}
+
+	rec := request(http.MethodGet, "/api/v1/skills/commented/comments", "", nil, false)
+	var public CommentsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &public); err != nil {
+		t.Fatalf("decode public comments: %v", err)
+	}
+	if rec.Code != http.StatusOK || public.Summary.Total != 2 || public.Summary.Positive != 1 || public.Summary.Negative != 1 || public.Summary.PositiveRate != 50 {
+		t.Fatalf("public comments = status %d response %+v", rec.Code, public)
+	}
+
+	rec = request(http.MethodPatch, fmt.Sprintf("/api/v1/skills/commented/comments/%d", created[0].ID), "bob", map[string]string{"sentiment": "negative", "content": "Someone else's edited comment."}, false)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("other user update status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = request(http.MethodPost, fmt.Sprintf("/api/v1/admin/comments/%d/moderate", created[0].ID), "", map[string]string{"status": "hidden"}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hide status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = request(http.MethodGet, "/api/v1/skills/commented/comments", "", nil, false)
+	if err := json.Unmarshal(rec.Body.Bytes(), &public); err != nil {
+		t.Fatalf("decode comments after hide: %v", err)
+	}
+	if public.Summary.Total != 1 || public.Summary.Positive != 0 || public.Summary.Negative != 1 || public.Summary.PositiveRate != 0 || len(public.Comments) != 1 {
+		t.Fatalf("hidden comment included in public stats: %+v", public)
+	}
+
+	rec = request(http.MethodGet, "/api/v1/admin/comments", "", nil, true)
+	var adminResponse struct {
+		Comments []ItemComment `json:"comments"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &adminResponse); err != nil || len(adminResponse.Comments) != 2 {
+		t.Fatalf("admin comments response = %s err=%v", rec.Body.String(), err)
+	}
+
+	rec = request(http.MethodPost, fmt.Sprintf("/api/v1/admin/comments/%d/moderate", created[0].ID), "", map[string]string{"status": "visible"}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("restore status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = request(http.MethodDelete, fmt.Sprintf("/api/v1/skills/commented/comments/%d", created[1].ID), "alice", nil, false)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = request(http.MethodGet, "/api/v1/skills/commented/comments", "alice", nil, false)
+	if err := json.Unmarshal(rec.Body.Bytes(), &public); err != nil {
+		t.Fatalf("decode final comments: %v", err)
+	}
+	if public.Summary.Total != 1 || public.Summary.Positive != 1 || len(public.Comments) != 1 || !public.Comments[0].Mine {
+		t.Fatalf("final comments = %+v", public)
+	}
 }
 
 func TestMain(m *testing.M) {

@@ -30,6 +30,8 @@ type Config struct {
 	OIDCScopes          string
 	OIDCAdminUserIDs    string
 	OIDCSuccessRedirect string
+	OIDCLogoutURL       string
+	OIDCLogoutCallback  string
 	OIDCDebugClaims     bool
 	EnableLocalAuth     bool
 	MaxUploadBytes      int64
@@ -73,6 +75,11 @@ const (
 	SandboxKindContainerImage   = "container-image"
 	WebsiteKindExternal         = "external"
 	WebsiteKindLocalApp         = "local-app"
+	CommentSentimentPositive    = "positive"
+	CommentSentimentNegative    = "negative"
+	CommentStatusVisible        = "visible"
+	CommentStatusHidden         = "hidden"
+	CommentStatusDeleted        = "deleted"
 )
 
 type PublishRequest struct {
@@ -231,6 +238,40 @@ type PublicItem struct {
 	DownloadCount     int                       `json:"downloadCount"`
 	FavoriteCount     int                       `json:"favoriteCount"`
 	Favorited         bool                      `json:"favorited"`
+	CommentCount      int                       `json:"commentCount"`
+	PositiveCount     int                       `json:"positiveCount"`
+	NegativeCount     int                       `json:"negativeCount"`
+	PositiveRate      float64                   `json:"positiveRate"`
+}
+
+type CommentSummary struct {
+	Total        int     `json:"total"`
+	Positive     int     `json:"positive"`
+	Negative     int     `json:"negative"`
+	PositiveRate float64 `json:"positiveRate"`
+}
+
+type ItemComment struct {
+	ID               int64  `json:"id"`
+	ItemType         string `json:"itemType"`
+	ItemID           string `json:"itemId"`
+	UserID           string `json:"userId,omitempty"`
+	Author           string `json:"author"`
+	Sentiment        string `json:"sentiment"`
+	Content          string `json:"content"`
+	Status           string `json:"status,omitempty"`
+	Mine             bool   `json:"mine"`
+	ModeratedBy      string `json:"moderatedBy,omitempty"`
+	ModerationReason string `json:"moderationReason,omitempty"`
+	ModeratedAt      string `json:"moderatedAt,omitempty"`
+	CreatedAt        string `json:"createdAt"`
+	UpdatedAt        string `json:"updatedAt"`
+}
+
+type CommentsResponse struct {
+	Summary    CommentSummary `json:"summary"`
+	Comments   []ItemComment  `json:"comments"`
+	Pagination Pagination     `json:"pagination"`
 }
 
 type CatalogResponse struct {
@@ -300,6 +341,10 @@ type DesktopCatalogItem struct {
 	DownloadCount     int                       `json:"downloadCount"`
 	FavoriteCount     int                       `json:"favoriteCount"`
 	Favorited         bool                      `json:"favorited"`
+	CommentCount      int                       `json:"commentCount"`
+	PositiveCount     int                       `json:"positiveCount"`
+	NegativeCount     int                       `json:"negativeCount"`
+	PositiveRate      float64                   `json:"positiveRate"`
 }
 
 type DesktopCatalogResponse struct {
@@ -367,4 +412,8 @@ type storedItem struct {
 	DownloadCount     int
 	FavoriteCount     int
 	Favorited         bool
+	CommentCount      int
+	PositiveCount     int
+	NegativeCount     int
+	PositiveRate      float64
 }

@@ -32,6 +32,8 @@ https://market.example.com/api/v1/auth/oidc/callback
 
 Browser login starts at `GET /api/v1/auth/oidc/login`; after a successful callback Market stores only a signed, short-lived session cookie and redirects to `MARKET_OIDC_SUCCESS_REDIRECT`. It uses authorization-code flow with PKCE and validates the ID Token issuer, audience, signature and nonce. `MARKET_OIDC_ADMIN_USER_IDS` is a comma-separated allowlist of `staffno` or `sub` values that receive Market admin access. The default role for another authenticated OIDC user is `creator`.
 
+Browser logout navigates to `GET /api/v1/auth/oidc/logout`. Market clears its local session cookie and, when `MARKET_OIDC_LOGOUT_URL` is configured, redirects to that IAM endpoint with `MARKET_OIDC_LOGOUT_CALLBACK` as the required `callback` query parameter. The callback must be an absolute HTTP(S) URL no longer than 128 characters.
+
 `MARKET_ENABLE_LOCAL_AUTH` is disabled by default. Enable it only for local development; it exposes an unsigned test-login endpoint and must never be enabled in production.
 
 ## Storage and deployment

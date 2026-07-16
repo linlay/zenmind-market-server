@@ -21,6 +21,11 @@ type Store struct {
 	db *sql.DB
 }
 
+var (
+	errCommentForbidden = errors.New("comment belongs to another user")
+	errCommentHidden    = errors.New("hidden comment cannot be edited")
+)
+
 type oidcUserProfile struct {
 	Issuer           string
 	Subject          string
@@ -384,6 +389,20 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			PRIMARY KEY (item_type, item_id, user_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS item_comments (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			item_type TEXT NOT NULL,
+			item_id TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			sentiment TEXT NOT NULL CHECK (sentiment IN ('positive', 'negative')),
+			content TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'visible' CHECK (status IN ('visible', 'hidden', 'deleted')),
+			moderated_by TEXT NOT NULL DEFAULT '',
+			moderation_reason TEXT NOT NULL DEFAULT '',
+			moderated_at TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS skill_profiles (
 			item_type TEXT NOT NULL,
 			item_id TEXT NOT NULL,
@@ -405,6 +424,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_download_events_item ON download_events (item_type, item_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_favorite_items_item ON favorite_items (item_type, item_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_item_comments_item ON item_comments (item_type, item_id, status, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_item_comments_user ON item_comments (user_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_identities_user ON user_identities (user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles (user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_skill_profiles_category ON skill_profiles (kind, category)`,
@@ -935,7 +956,7 @@ func (s *Store) Unpublish(ctx context.Context, itemType ItemType, id, version st
 			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
 			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
 			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
-			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
+			itemType, id, replacement, itemType, id, replacement,
 			now, itemType, id)
 	}
 	if err != nil {
@@ -1739,6 +1760,50 @@ func (s *Store) loadStatsForItems(ctx context.Context, items []storedItem, onlyT
 		return err
 	}
 
+	commentQuery := `SELECT c.item_type, c.item_id, COUNT(*),
+		SUM(CASE WHEN c.sentiment = ? THEN 1 ELSE 0 END),
+		SUM(CASE WHEN c.sentiment = ? THEN 1 ELSE 0 END)
+		FROM item_comments c
+		JOIN items i ON i.type = c.item_type AND i.id = c.item_id
+		WHERE c.status = ?`
+	args = []any{CommentSentimentPositive, CommentSentimentNegative, CommentStatusVisible}
+	if publicOnly {
+		commentQuery += ` AND i.published = 1 AND i.review_status = ?`
+		args = append(args, ReviewStatusApproved)
+	}
+	if onlyType != "" {
+		commentQuery += ` AND i.type = ?`
+		args = append(args, onlyType)
+	}
+	commentQuery += ` GROUP BY c.item_type, c.item_id`
+	rows, err = s.db.QueryContext(ctx, commentQuery, args...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var rawType, id string
+		var total, positive, negative int
+		if err := rows.Scan(&rawType, &id, &total, &positive, &negative); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if itemIndex, ok := index[itemLookupKey{itemType: ItemType(rawType), id: id}]; ok {
+			items[itemIndex].CommentCount = total
+			items[itemIndex].PositiveCount = positive
+			items[itemIndex].NegativeCount = negative
+			if total > 0 {
+				items[itemIndex].PositiveRate = float64(positive) * 100 / float64(total)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
 	viewerUserID = strings.TrimSpace(viewerUserID)
 	if viewerUserID == "" {
 		return nil
@@ -1767,6 +1832,171 @@ func (s *Store) loadStatsForItems(ctx context.Context, items []storedItem, onlyT
 		}
 	}
 	return rows.Err()
+}
+
+func (s *Store) ListPublicComments(ctx context.Context, itemType ItemType, itemID, viewerUserID string, page, limit int) ([]ItemComment, int, error) {
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM item_comments WHERE item_type = ? AND item_id = ? AND status = ?`, itemType, itemID, CommentStatusVisible).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	start, _ := pageWindow(page, limit, total)
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.item_type, c.item_id, c.user_id,
+		COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, ''), c.user_id),
+		c.sentiment, c.content, c.created_at, c.updated_at
+		FROM item_comments c LEFT JOIN users u ON u.id = c.user_id
+		WHERE c.item_type = ? AND c.item_id = ? AND c.status = ?
+		ORDER BY c.created_at DESC, c.id DESC LIMIT ? OFFSET ?`, itemType, itemID, CommentStatusVisible, limit, start)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	comments := make([]ItemComment, 0)
+	for rows.Next() {
+		var comment ItemComment
+		var ownerID string
+		if err := rows.Scan(&comment.ID, &comment.ItemType, &comment.ItemID, &ownerID, &comment.Author, &comment.Sentiment, &comment.Content, &comment.CreatedAt, &comment.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		comment.Mine = viewerUserID != "" && ownerID == viewerUserID
+		comments = append(comments, comment)
+	}
+	return comments, total, rows.Err()
+}
+
+func (s *Store) CreateComment(ctx context.Context, itemType ItemType, itemID, userID, sentiment, content string) (ItemComment, error) {
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM items WHERE type = ? AND id = ? AND published = 1 AND review_status = ?`, itemType, itemID, ReviewStatusApproved).Scan(&exists); err != nil {
+		return ItemComment{}, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO item_comments (item_type, item_id, user_id, sentiment, content, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, itemType, itemID, userID, sentiment, content, CommentStatusVisible, now, now)
+	if err != nil {
+		return ItemComment{}, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return ItemComment{}, err
+	}
+	return s.getComment(ctx, id, userID, false)
+}
+
+func (s *Store) UpdateOwnComment(ctx context.Context, id int64, itemType ItemType, itemID, userID, sentiment, content string) (ItemComment, error) {
+	ownerID, status, err := s.commentOwnerAndStatusForItem(ctx, id, itemType, itemID)
+	if err != nil {
+		return ItemComment{}, err
+	}
+	if ownerID != userID {
+		return ItemComment{}, errCommentForbidden
+	}
+	if status == CommentStatusHidden {
+		return ItemComment{}, errCommentHidden
+	}
+	if status == CommentStatusDeleted {
+		return ItemComment{}, sql.ErrNoRows
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `UPDATE item_comments SET sentiment = ?, content = ?, updated_at = ? WHERE id = ?`, sentiment, content, now, id); err != nil {
+		return ItemComment{}, err
+	}
+	return s.getComment(ctx, id, userID, false)
+}
+
+func (s *Store) DeleteOwnComment(ctx context.Context, id int64, itemType ItemType, itemID, userID string) error {
+	ownerID, status, err := s.commentOwnerAndStatusForItem(ctx, id, itemType, itemID)
+	if err != nil {
+		return err
+	}
+	if ownerID != userID {
+		return errCommentForbidden
+	}
+	if status == CommentStatusDeleted {
+		return sql.ErrNoRows
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE item_comments SET status = ?, updated_at = ? WHERE id = ?`, CommentStatusDeleted, time.Now().UTC().Format(time.RFC3339Nano), id)
+	return err
+}
+
+func (s *Store) ListAdminComments(ctx context.Context, status string, page, limit int) ([]ItemComment, int, error) {
+	where := ` WHERE c.status <> ?`
+	args := []any{CommentStatusDeleted}
+	if status == CommentStatusVisible || status == CommentStatusHidden {
+		where += ` AND c.status = ?`
+		args = append(args, status)
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM item_comments c`+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	start, _ := pageWindow(page, limit, total)
+	query := `SELECT c.id, c.item_type, c.item_id, c.user_id,
+		COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, ''), c.user_id),
+		c.sentiment, c.content, c.status, c.moderated_by, c.moderation_reason, c.moderated_at, c.created_at, c.updated_at
+		FROM item_comments c LEFT JOIN users u ON u.id = c.user_id` + where + ` ORDER BY c.created_at DESC, c.id DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, start)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	comments := make([]ItemComment, 0)
+	for rows.Next() {
+		var comment ItemComment
+		if err := rows.Scan(&comment.ID, &comment.ItemType, &comment.ItemID, &comment.UserID, &comment.Author, &comment.Sentiment, &comment.Content, &comment.Status, &comment.ModeratedBy, &comment.ModerationReason, &comment.ModeratedAt, &comment.CreatedAt, &comment.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		comments = append(comments, comment)
+	}
+	return comments, total, rows.Err()
+}
+
+func (s *Store) ModerateComment(ctx context.Context, id int64, status, reason, moderator string) (ItemComment, error) {
+	_, currentStatus, err := s.commentOwnerAndStatus(ctx, id)
+	if err != nil {
+		return ItemComment{}, err
+	}
+	if currentStatus == CommentStatusDeleted {
+		return ItemComment{}, sql.ErrNoRows
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `UPDATE item_comments SET status = ?, moderated_by = ?, moderation_reason = ?, moderated_at = ?, updated_at = ? WHERE id = ?`, status, moderator, reason, now, now, id); err != nil {
+		return ItemComment{}, err
+	}
+	return s.getComment(ctx, id, "", true)
+}
+
+func (s *Store) commentOwnerAndStatus(ctx context.Context, id int64) (string, string, error) {
+	var ownerID, status string
+	err := s.db.QueryRowContext(ctx, `SELECT user_id, status FROM item_comments WHERE id = ?`, id).Scan(&ownerID, &status)
+	return ownerID, status, err
+}
+
+func (s *Store) commentOwnerAndStatusForItem(ctx context.Context, id int64, itemType ItemType, itemID string) (string, string, error) {
+	var ownerID, status string
+	err := s.db.QueryRowContext(ctx, `SELECT user_id, status FROM item_comments WHERE id = ? AND item_type = ? AND item_id = ?`, id, itemType, itemID).Scan(&ownerID, &status)
+	return ownerID, status, err
+}
+
+func (s *Store) getComment(ctx context.Context, id int64, viewerUserID string, admin bool) (ItemComment, error) {
+	var comment ItemComment
+	err := s.db.QueryRowContext(ctx, `SELECT c.id, c.item_type, c.item_id, c.user_id,
+		COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, ''), c.user_id),
+		c.sentiment, c.content, c.status, c.moderated_by, c.moderation_reason, c.moderated_at, c.created_at, c.updated_at
+		FROM item_comments c LEFT JOIN users u ON u.id = c.user_id WHERE c.id = ?`, id).Scan(
+		&comment.ID, &comment.ItemType, &comment.ItemID, &comment.UserID, &comment.Author, &comment.Sentiment, &comment.Content, &comment.Status,
+		&comment.ModeratedBy, &comment.ModerationReason, &comment.ModeratedAt, &comment.CreatedAt, &comment.UpdatedAt,
+	)
+	if err != nil {
+		return ItemComment{}, err
+	}
+	comment.Mine = viewerUserID != "" && comment.UserID == viewerUserID
+	if !admin {
+		comment.UserID = ""
+		comment.Status = ""
+		comment.ModeratedBy = ""
+		comment.ModerationReason = ""
+		comment.ModeratedAt = ""
+	}
+	return comment, nil
 }
 
 func (s *Store) loadPlatformsForVersions(ctx context.Context, itemType ItemType, id string, versions []PublicVersion) error {
@@ -2020,6 +2250,10 @@ func publicItem(item storedItem) PublicItem {
 		DownloadCount:     item.DownloadCount,
 		FavoriteCount:     item.FavoriteCount,
 		Favorited:         item.Favorited,
+		CommentCount:      item.CommentCount,
+		PositiveCount:     item.PositiveCount,
+		NegativeCount:     item.NegativeCount,
+		PositiveRate:      item.PositiveRate,
 	}
 }
 

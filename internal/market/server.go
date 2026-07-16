@@ -92,6 +92,7 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/me/favorites", a.handleMyFavorites)
 	mux.HandleFunc("GET /api/v1/auth/oidc/login", a.handleOIDCLogin)
 	mux.HandleFunc("GET /api/v1/auth/oidc/callback", a.handleOIDCCallback)
+	mux.HandleFunc("GET /api/v1/auth/oidc/logout", a.handleOIDCLogout)
 	mux.HandleFunc("POST /api/v1/auth/oidc/logout", a.handleOIDCLogout)
 	mux.HandleFunc("GET /api/v1/markets", a.handleMarkets)
 	mux.HandleFunc("GET /api/v1/catalog", a.handleCatalog)
@@ -126,6 +127,18 @@ func (a *App) Routes() http.Handler {
 		mux.HandleFunc("DELETE /api/v1/"+route.Path+"/{id}/favorite", func(w http.ResponseWriter, r *http.Request) {
 			a.handleMarketFavorite(w, r, route.Type, false)
 		})
+		mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}/comments", func(w http.ResponseWriter, r *http.Request) {
+			a.handleMarketComments(w, r, route.Type)
+		})
+		mux.HandleFunc("POST /api/v1/"+route.Path+"/{id}/comments", func(w http.ResponseWriter, r *http.Request) {
+			a.handleCreateMarketComment(w, r, route.Type)
+		})
+		mux.HandleFunc("PATCH /api/v1/"+route.Path+"/{id}/comments/{commentId}", func(w http.ResponseWriter, r *http.Request) {
+			a.handleUpdateMarketComment(w, r, route.Type)
+		})
+		mux.HandleFunc("DELETE /api/v1/"+route.Path+"/{id}/comments/{commentId}", func(w http.ResponseWriter, r *http.Request) {
+			a.handleDeleteMarketComment(w, r, route.Type)
+		})
 		mux.HandleFunc("POST /api/v1/admin/"+route.Path+"/publish", a.requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 			a.handleTypedPublish(w, r, route.Type)
 		}))
@@ -134,6 +147,8 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/reviews", a.requireAdmin(a.handleAdminReviews))
 	mux.HandleFunc("POST /api/v1/admin/reviews/{type}/{id}", a.requireAdmin(a.handleAdminReviewUpdate))
 	mux.HandleFunc("POST /api/v1/admin/unpublish", a.requireAdmin(a.handleUnpublish))
+	mux.HandleFunc("GET /api/v1/admin/comments", a.requireAdmin(a.handleAdminComments))
+	mux.HandleFunc("POST /api/v1/admin/comments/{commentId}/moderate", a.requireAdmin(a.handleAdminModerateComment))
 	mux.HandleFunc("/npm/", a.handleNPM)
 	mux.HandleFunc("/artifacts/", a.handleArtifacts)
 	return securityHeaders(mux)
@@ -269,6 +284,10 @@ func (a *App) handleDesktopCatalog(w http.ResponseWriter, r *http.Request) {
 			DownloadCount:     public.DownloadCount,
 			FavoriteCount:     public.FavoriteCount,
 			Favorited:         public.Favorited,
+			CommentCount:      public.CommentCount,
+			PositiveCount:     public.PositiveCount,
+			NegativeCount:     public.NegativeCount,
+			PositiveRate:      public.PositiveRate,
 		})
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -606,6 +625,171 @@ func (a *App) handleMarketFavorite(w http.ResponseWriter, r *http.Request, itemT
 		return
 	}
 	writeJSON(w, http.StatusOK, marketItem(item))
+}
+
+func (a *App) handleMarketComments(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	id := sanitizeSlug(r.PathValue("id"))
+	item, err := a.store.GetPublic(r.Context(), itemType, id, a.viewerUserID(r))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	page := intQuery(r, "page", 1)
+	limit := intQuery(r, "limit", 20)
+	if limit > 100 {
+		limit = 100
+	}
+	comments, total, err := a.store.ListPublicComments(r.Context(), itemType, id, a.viewerUserID(r), page, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, CommentsResponse{
+		Summary:    CommentSummary{Total: item.CommentCount, Positive: item.PositiveCount, Negative: item.NegativeCount, PositiveRate: item.PositiveRate},
+		Comments:   comments,
+		Pagination: Pagination{Page: page, Limit: limit, Total: total},
+	})
+}
+
+func (a *App) handleCreateMarketComment(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	userID, ok := a.authorizedMarketUser(w, r)
+	if !ok {
+		return
+	}
+	sentiment, content, ok := decodeCommentInput(w, r)
+	if !ok {
+		return
+	}
+	comment, err := a.store.CreateComment(r.Context(), itemType, sanitizeSlug(r.PathValue("id")), userID, sentiment, content)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, comment)
+}
+
+func (a *App) handleUpdateMarketComment(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	userID, ok := a.authorizedMarketUser(w, r)
+	if !ok {
+		return
+	}
+	commentID, ok := parseCommentID(w, r)
+	if !ok {
+		return
+	}
+	sentiment, content, ok := decodeCommentInput(w, r)
+	if !ok {
+		return
+	}
+	comment, err := a.store.UpdateOwnComment(r.Context(), commentID, itemType, sanitizeSlug(r.PathValue("id")), userID, sentiment, content)
+	writeCommentMutationResult(w, comment, err)
+}
+
+func (a *App) handleDeleteMarketComment(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	userID, ok := a.authorizedMarketUser(w, r)
+	if !ok {
+		return
+	}
+	commentID, ok := parseCommentID(w, r)
+	if !ok {
+		return
+	}
+	if err := a.store.DeleteOwnComment(r.Context(), commentID, itemType, sanitizeSlug(r.PathValue("id")), userID); err != nil {
+		writeCommentMutationResult(w, ItemComment{}, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *App) handleAdminComments(w http.ResponseWriter, r *http.Request) {
+	page := intQuery(r, "page", 1)
+	limit := intQuery(r, "limit", 100)
+	if limit > 500 {
+		limit = 100
+	}
+	comments, total, err := a.store.ListAdminComments(r.Context(), strings.TrimSpace(r.URL.Query().Get("status")), page, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"comments": comments, "pagination": Pagination{Page: page, Limit: limit, Total: total}})
+}
+
+func (a *App) handleAdminModerateComment(w http.ResponseWriter, r *http.Request) {
+	commentID, ok := parseCommentID(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	req.Status = strings.ToLower(strings.TrimSpace(req.Status))
+	if req.Status != CommentStatusVisible && req.Status != CommentStatusHidden {
+		writeError(w, http.StatusBadRequest, "invalid_status", "status must be visible or hidden")
+		return
+	}
+	comment, err := a.store.ModerateComment(r.Context(), commentID, req.Status, strings.TrimSpace(req.Reason), a.reviewerID(r))
+	writeCommentMutationResult(w, comment, err)
+}
+
+func decodeCommentInput(w http.ResponseWriter, r *http.Request) (string, string, bool) {
+	var req struct {
+		Sentiment string `json:"sentiment"`
+		Content   string `json:"content"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return "", "", false
+	}
+	req.Sentiment = strings.ToLower(strings.TrimSpace(req.Sentiment))
+	req.Content = strings.TrimSpace(req.Content)
+	if req.Sentiment != CommentSentimentPositive && req.Sentiment != CommentSentimentNegative {
+		writeError(w, http.StatusBadRequest, "invalid_sentiment", "sentiment must be positive or negative")
+		return "", "", false
+	}
+	length := len([]rune(req.Content))
+	if length < 5 || length > 1000 {
+		writeError(w, http.StatusBadRequest, "invalid_content", "comment content must contain 5 to 1000 characters")
+		return "", "", false
+	}
+	return req.Sentiment, req.Content, true
+}
+
+func parseCommentID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("commentId")), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_comment_id", "comment id is invalid")
+		return 0, false
+	}
+	return id, true
+}
+
+func writeCommentMutationResult(w http.ResponseWriter, comment ItemComment, err error) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		writeError(w, http.StatusNotFound, "not_found", "comment not found")
+	case errors.Is(err, errCommentForbidden):
+		writeError(w, http.StatusForbidden, "forbidden", "comment belongs to another user")
+	case errors.Is(err, errCommentHidden):
+		writeError(w, http.StatusConflict, "comment_hidden", "hidden comment cannot be edited")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+	default:
+		writeJSON(w, http.StatusOK, comment)
+	}
 }
 
 func (a *App) handlePublish(w http.ResponseWriter, r *http.Request) {
