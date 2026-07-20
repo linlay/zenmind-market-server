@@ -11,9 +11,11 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -31,6 +33,500 @@ import (
 func newTestApp(t *testing.T) *App {
 	t.Helper()
 	return newTestAppWithConfig(t, Config{})
+}
+
+func TestDetailViewCountMigrationIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "market.db")
+
+	store, err := OpenStore(ctx, databasePath)
+	if err != nil {
+		t.Fatalf("OpenStore() initial error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() initial error = %v", err)
+	}
+
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open migration fixture: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE items DROP COLUMN detail_view_count`); err != nil {
+		t.Fatalf("remove detail_view_count fixture column: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close migration fixture: %v", err)
+	}
+
+	store, err = OpenStore(ctx, databasePath)
+	if err != nil {
+		t.Fatalf("OpenStore() migration error = %v", err)
+	}
+	defer store.Close()
+
+	var columnCount int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'detail_view_count'`).Scan(&columnCount); err != nil {
+		t.Fatalf("read migrated column: %v", err)
+	}
+	if columnCount != 1 {
+		t.Fatalf("detail_view_count columns = %d, want 1", columnCount)
+	}
+
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("second migrate() error = %v", err)
+	}
+}
+
+func readDetailViewCount(t *testing.T, app *App, itemType ItemType, id string) int64 {
+	t.Helper()
+	var count int64
+	if err := app.store.db.QueryRowContext(context.Background(),
+		`SELECT detail_view_count FROM items WHERE type = ? AND id = ?`, itemType, id,
+	).Scan(&count); err != nil {
+		t.Fatalf("read detail view count for %s:%s: %v", itemType, id, err)
+	}
+	return count
+}
+
+func assertJSONOmitsField(t *testing.T, body string, field string) {
+	t.Helper()
+	if strings.Contains(body, `"`+field+`"`) {
+		t.Fatalf("response leaked %s: %s", field, body)
+	}
+}
+
+func TestDetailViewHTTPContract(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	t.Run("counts anonymous and repeated clicks on every market route", func(t *testing.T) {
+		for _, route := range marketRouteDefinitions() {
+			id := "route-" + strings.ReplaceAll(route.Path, "-", "_")
+			_, err := app.store.db.ExecContext(ctx, `INSERT INTO items
+				(type, id, name, latest_version, creator_id, review_status, published, published_at, updated_at)
+				VALUES (?, ?, ?, '1.0.0', 'route-owner', ?, 1, ?, ?)`,
+				route.Type, id, id, ReviewStatusApproved, now, now)
+			if err != nil {
+				t.Fatalf("insert %s fixture: %v", route.Path, err)
+			}
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/"+route.Path+"/"+id+"/view", nil)
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("%s view status = %d body=%s", route.Path, rec.Code, rec.Body.String())
+			}
+			if got := readDetailViewCount(t, app, route.Type, id); got != 1 {
+				t.Fatalf("%s detail_view_count = %d, want 1", route.Path, got)
+			}
+		}
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/route-skills/view", nil)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("repeated anonymous view status = %d body=%s", rec.Code, rec.Body.String())
+		}
+		if got := readDetailViewCount(t, app, TypeSkill, "route-skills"); got != 2 {
+			t.Fatalf("repeated detail_view_count = %d, want 2", got)
+		}
+	})
+
+	t.Run("exposes the count only in the creator response", func(t *testing.T) {
+		_, err := app.store.db.ExecContext(ctx, `INSERT INTO items
+			(type, id, name, latest_version, creator_id, review_status, detail_view_count, published, published_at, updated_at)
+			VALUES (?, 'private-view', 'Private View', '1.0.0', 'creator-a', ?, 7, 1, ?, ?)`,
+			TypeSkill, ReviewStatusApproved, now, now)
+		if err != nil {
+			t.Fatalf("insert visibility fixture: %v", err)
+		}
+
+		visibilityChecks := []struct {
+			path  string
+			admin bool
+		}{
+			{path: "/api/v1/catalog"},
+			{path: "/api/v1/items/skill/private-view"},
+			{path: "/api/v1/desktop/catalog"},
+			{path: "/api/v1/admin/reviews", admin: true},
+		}
+		for _, check := range visibilityChecks {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, check.path, nil)
+			if check.admin {
+				setProxyUserWithRole(req, "admin-a", "admin")
+			}
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET %s status = %d body=%s", check.path, rec.Code, rec.Body.String())
+			}
+			assertJSONOmitsField(t, rec.Body.String(), "detailViewCount")
+		}
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/creator/items", nil)
+		setProxyUser(req, "creator-a")
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("creator items status = %d body=%s", rec.Code, rec.Body.String())
+		}
+		var creatorCatalog struct {
+			Items []struct {
+				PublicItem
+				DetailViewCount int64 `json:"detailViewCount"`
+			} `json:"items"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &creatorCatalog); err != nil {
+			t.Fatalf("decode creator catalog: %v", err)
+		}
+		if len(creatorCatalog.Items) != 1 || creatorCatalog.Items[0].ID != "private-view" {
+			t.Fatalf("creator items = %+v, want private-view", creatorCatalog.Items)
+		}
+		if creatorCatalog.Items[0].DetailViewCount != 7 {
+			t.Fatalf("creator detailViewCount = %d, want 7", creatorCatalog.Items[0].DetailViewCount)
+		}
+	})
+
+	t.Run("rejects missing and unpublished items without incrementing", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/missing/view", nil)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("missing view status = %d, want 404", rec.Code)
+		}
+
+		_, err := app.store.db.ExecContext(ctx, `INSERT INTO items
+			(type, id, name, latest_version, creator_id, review_status, detail_view_count, published, published_at, updated_at)
+			VALUES (?, 'pending-view', 'Pending View', '1.0.0', 'creator-a', ?, 0, 0, ?, ?)`,
+			TypeSkill, ReviewStatusPending, now, now)
+		if err != nil {
+			t.Fatalf("insert pending fixture: %v", err)
+		}
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/api/v1/skills/pending-view/view", nil)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("pending view status = %d, want 404", rec.Code)
+		}
+		if got := readDetailViewCount(t, app, TypeSkill, "pending-view"); got != 0 {
+			t.Fatalf("pending detail_view_count = %d, want 0", got)
+		}
+	})
+}
+
+func TestDetailViewHTTPStoreFailureDoesNotExposeDatabaseError(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := app.store.db.ExecContext(context.Background(), `DROP TABLE items`); err != nil {
+		t.Fatalf("drop items table to force store failure: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/store-failure/view", nil)
+	app.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("detail view status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"message":"unable to record detail view"`) {
+		t.Fatalf("detail view response missing generic message: %s", body)
+	}
+	for _, rawDatabaseError := range []string{"no such table", "SQL logic error"} {
+		if strings.Contains(body, rawDatabaseError) {
+			t.Fatalf("detail view response exposed database error %q: %s", rawDatabaseError, body)
+		}
+	}
+}
+
+func publishDetailViewSkill(t *testing.T, handler http.Handler, id, version string) {
+	t.Helper()
+	publishMultipart(t, handler, PublishRequest{
+		Type: TypeSkill, ID: id, Name: id,
+		Version: version, ArchiveType: "zip",
+	}, zipArchive(t, map[string]string{id + "/SKILL.md": "# " + id + "\n"}))
+}
+
+func TestIncrementDetailViewCountIsAtomic(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishDetailViewSkill(t, handler, "view-counter", "1.0.0")
+
+	const requests = 40
+	errs := make(chan error, requests)
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- app.store.IncrementDetailViewCount(context.Background(), TypeSkill, "view-counter")
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("IncrementDetailViewCount() error = %v", err)
+		}
+	}
+
+	if got := readDetailViewCount(t, app, TypeSkill, "view-counter"); got != requests {
+		t.Fatalf("detail_view_count = %d, want %d", got, requests)
+	}
+}
+
+func TestDetailViewCountSurvivesNewVersion(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishDetailViewSkill(t, handler, "versioned-view", "1.0.0")
+	for range 3 {
+		if err := app.store.IncrementDetailViewCount(context.Background(), TypeSkill, "versioned-view"); err != nil {
+			t.Fatalf("IncrementDetailViewCount() error = %v", err)
+		}
+	}
+
+	publishDetailViewSkill(t, handler, "versioned-view", "2.0.0")
+
+	if got := readDetailViewCount(t, app, TypeSkill, "versioned-view"); got != 3 {
+		t.Fatalf("detail_view_count after version publish = %d, want 3", got)
+	}
+}
+
+func TestIncrementDetailViewCountReturnsNotFound(t *testing.T) {
+	app := newTestApp(t)
+	err := app.store.IncrementDetailViewCount(context.Background(), TypeSkill, "missing")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing item error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestIncrementDetailViewCountReturnsNotFoundForIneligibleItems(t *testing.T) {
+	tests := []struct {
+		name   string
+		column string
+		value  any
+	}{
+		{name: "unpublished", column: "published", value: 0},
+		{name: "not approved", column: "review_status", value: ReviewStatusRejected},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := newTestApp(t)
+			id := "ineligible-" + strings.ReplaceAll(tt.name, " ", "-")
+			publishDetailViewSkill(t, app.Routes(), id, "1.0.0")
+			if _, err := app.store.db.ExecContext(context.Background(),
+				`UPDATE items SET `+tt.column+` = ? WHERE type = ? AND id = ?`, tt.value, TypeSkill, id,
+			); err != nil {
+				t.Fatalf("make item %s: %v", tt.name, err)
+			}
+
+			err := app.store.IncrementDetailViewCount(context.Background(), TypeSkill, id)
+			if !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("IncrementDetailViewCount() error = %v, want sql.ErrNoRows", err)
+			}
+			if got := readDetailViewCount(t, app, TypeSkill, id); got != 0 {
+				t.Fatalf("detail_view_count = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func holdAllStoreConnections(t *testing.T, app *App) []*sql.Conn {
+	t.Helper()
+	connections := make([]*sql.Conn, 0, 8)
+	for range 8 {
+		connection, err := app.store.db.Conn(context.Background())
+		if err != nil {
+			closeStoreConnections(connections)
+			t.Fatalf("db.Conn() error = %v", err)
+		}
+		connections = append(connections, connection)
+	}
+	return connections
+}
+
+func closeStoreConnections(connections []*sql.Conn) {
+	for _, connection := range connections {
+		_ = connection.Close()
+	}
+}
+
+func waitForDBStats(t *testing.T, db *sql.DB, timeout time.Duration, condition func(sql.DBStats) bool) sql.DBStats {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		stats := db.Stats()
+		if condition(stats) {
+			return stats
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("database stats condition not met before %v: %+v", timeout, stats)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestIncrementDetailViewCountBoundsEndToEndPoolWait(t *testing.T) {
+	app := newTestApp(t)
+	publishDetailViewSkill(t, app.Routes(), "pool-timeout", "1.0.0")
+	connections := holdAllStoreConnections(t, app)
+	defer closeStoreConnections(connections)
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- app.store.IncrementDetailViewCount(context.Background(), TypeSkill, "pool-timeout")
+	}()
+	waitForDBStats(t, app.store.db, time.Second, func(stats sql.DBStats) bool {
+		return stats.WaitCount > 0
+	})
+
+	select {
+	case err := <-done:
+		elapsed := time.Since(started)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("IncrementDetailViewCount() error = %v, want context.DeadlineExceeded", err)
+		}
+		if elapsed < 7500*time.Millisecond {
+			t.Fatalf("IncrementDetailViewCount() elapsed = %v, want existing retry budget retained", elapsed)
+		}
+		if elapsed >= 9500*time.Millisecond {
+			t.Fatalf("IncrementDetailViewCount() elapsed = %v, want under 9.5s", elapsed)
+		}
+	case <-time.After(9500 * time.Millisecond):
+		closeStoreConnections(connections)
+		err := <-done
+		t.Fatalf("IncrementDetailViewCount() exceeded end-to-end limit and returned %v after pool release", err)
+	}
+}
+
+func TestIncrementDetailViewCountPreservesCallerContext(t *testing.T) {
+	t.Run("earlier deadline", func(t *testing.T) {
+		app := newTestApp(t)
+		connections := holdAllStoreConnections(t, app)
+		defer closeStoreConnections(connections)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		err := app.store.IncrementDetailViewCount(ctx, TypeSkill, "missing")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("IncrementDetailViewCount() error = %v, want context.DeadlineExceeded", err)
+		}
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			t.Fatalf("IncrementDetailViewCount() elapsed = %v, want caller deadline preserved", elapsed)
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		app := newTestApp(t)
+		connections := holdAllStoreConnections(t, app)
+		defer closeStoreConnections(connections)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		initialWaitCount := app.store.db.Stats().WaitCount
+		go func() {
+			done <- app.store.IncrementDetailViewCount(ctx, TypeSkill, "missing")
+		}()
+		waitForDBStats(t, app.store.db, time.Second, func(stats sql.DBStats) bool {
+			return stats.WaitCount > initialWaitCount
+		})
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("IncrementDetailViewCount() error = %v, want context.Canceled", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("IncrementDetailViewCount() did not honor cancellation while waiting for a connection")
+		}
+	})
+}
+
+func TestSQLiteConnectionsUseBusyTimeout(t *testing.T) {
+	app := newTestApp(t)
+	ctx := context.Background()
+	connections := make([]*sql.Conn, 0, 4)
+	defer func() {
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+	}()
+
+	for range 4 {
+		connection, err := app.store.db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("db.Conn() error = %v", err)
+		}
+		connections = append(connections, connection)
+		var timeout int
+		if err := connection.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&timeout); err != nil {
+			t.Fatalf("read busy_timeout: %v", err)
+		}
+		if timeout != 2000 {
+			t.Fatalf("busy_timeout = %d, want 2000", timeout)
+		}
+	}
+}
+
+func TestIncrementDetailViewCountRetriesAfterBusyLock(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishDetailViewSkill(t, handler, "busy-view", "1.0.0")
+
+	ctx := context.Background()
+	locker, err := app.store.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db.Conn() error = %v", err)
+	}
+	defer locker.Close()
+	if _, err := locker.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("BEGIN IMMEDIATE error = %v", err)
+	}
+	blockers := make([]*sql.Conn, 0, 7)
+	defer closeStoreConnections(blockers)
+	for range 7 {
+		connection, err := app.store.db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("db.Conn() blocker error = %v", err)
+		}
+		blockers = append(blockers, connection)
+	}
+	initialWaitCount := app.store.db.Stats().WaitCount
+
+	done := make(chan error, 1)
+	go func() {
+		done <- app.store.IncrementDetailViewCount(context.Background(), TypeSkill, "busy-view")
+	}()
+	waitForDBStats(t, app.store.db, time.Second, func(stats sql.DBStats) bool {
+		return stats.WaitCount > initialWaitCount
+	})
+	if err := blockers[len(blockers)-1].Close(); err != nil {
+		t.Fatalf("close blocker error = %v", err)
+	}
+	blockers = blockers[:len(blockers)-1]
+	waitForDBStats(t, app.store.db, time.Second, func(stats sql.DBStats) bool {
+		return stats.InUse == 8
+	})
+	busyAttemptStarted := time.Now()
+	time.Sleep(2200 * time.Millisecond)
+	if _, err := locker.ExecContext(ctx, `ROLLBACK`); err != nil {
+		t.Fatalf("ROLLBACK error = %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("IncrementDetailViewCount() after lock error = %v", err)
+		}
+		if elapsed := time.Since(busyAttemptStarted); elapsed < 2*time.Second {
+			t.Fatalf("lock held after connection acquisition for %v, want at least one busy timeout", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("IncrementDetailViewCount() did not finish after lock release")
+	}
 }
 
 func newTestAppWithConfig(t *testing.T, override Config) *App {
@@ -1361,6 +1857,54 @@ func TestCreatorItemsUseStoredCreatorID(t *testing.T) {
 	}
 	if _, ok := catalog.Items[0].Metadata["creatorId"]; ok {
 		t.Fatalf("public metadata leaked creatorId: %+v", catalog.Items[0].Metadata)
+	}
+}
+
+func TestAuthenticatedAdminPublisherSeesDetailViewsInCreatorCatalog(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+
+	rawPublish, _ := json.Marshal(PublishRequest{
+		Type:         TypeWebsiteApp,
+		ID:           "admin-owned-app",
+		Name:         "Admin Owned App",
+		Version:      "1.0.0",
+		WebsiteKind:  WebsiteKindExternal,
+		ReviewStatus: ReviewStatusApproved,
+		Metadata:     map[string]string{"url": "https://example.test/admin-owned"},
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/webapps/publish", bytes.NewReader(rawPublish))
+	setProxyUserWithRole(req, "admin-publisher", "admin")
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/webapps/admin-owned-app/view", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("detail view status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/creator/items", nil)
+	setProxyUserWithRole(req, "admin-publisher", "admin")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("creator items status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var catalog CreatorCatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &catalog); err != nil {
+		t.Fatalf("decode creator catalog: %v", err)
+	}
+	if len(catalog.Items) != 1 || catalog.Items[0].ID != "admin-owned-app" {
+		t.Fatalf("creator catalog items = %+v, want admin-owned-app", catalog.Items)
+	}
+	if catalog.Items[0].DetailViewCount != 1 {
+		t.Fatalf("detailViewCount = %d, want 1", catalog.Items[0].DetailViewCount)
 	}
 }
 

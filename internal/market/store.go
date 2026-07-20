@@ -8,18 +8,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 type Store struct {
 	db *sql.DB
 }
+
+const storedItemSelectColumns = `type, id, name, description, readme, latest_version,
+	min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json,
+	dependencies_json, protocol_json, adp_yaml, review_status, review_note,
+	reviewed_at, reviewed_by, detail_view_count, published, published_at, updated_at`
 
 var (
 	errCommentForbidden = errors.New("comment belongs to another user")
@@ -54,7 +60,7 @@ func OpenStore(ctx context.Context, databasePath string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(databasePath), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", databasePath)
+	db, err := sql.Open("sqlite", sqliteDSN(databasePath))
 	if err != nil {
 		return nil, err
 	}
@@ -67,8 +73,59 @@ func OpenStore(ctx context.Context, databasePath string) (*Store, error) {
 	return store, nil
 }
 
+func sqliteDSN(databasePath string) string {
+	separator := "?"
+	if strings.Contains(databasePath, "?") {
+		separator = "&"
+	}
+	query := url.Values{}
+	query.Add("_pragma", "busy_timeout(2000)")
+	return databasePath + separator + query.Encode()
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+const detailViewIncrementTimeout = 8 * time.Second
+
+var detailViewRetryDelays = [...]time.Duration{25 * time.Millisecond, 75 * time.Millisecond}
+
+func (s *Store) IncrementDetailViewCount(ctx context.Context, itemType ItemType, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, detailViewIncrementTimeout)
+	defer cancel()
+
+	for attempt := 0; ; attempt++ {
+		result, err := s.db.ExecContext(ctx, `UPDATE items
+			SET detail_view_count = detail_view_count + 1
+			WHERE type = ? AND id = ? AND published = 1 AND review_status = ?`,
+			itemType, id, ReviewStatusApproved)
+		if err == nil {
+			affected, rowsErr := result.RowsAffected()
+			if rowsErr != nil {
+				return rowsErr
+			}
+			if affected == 0 {
+				return sql.ErrNoRows
+			}
+			return nil
+		}
+		if !isSQLiteBusy(err) || attempt >= len(detailViewRetryDelays) {
+			return err
+		}
+		timer := time.NewTimer(detailViewRetryDelays[attempt])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func isSQLiteBusy(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == 5
 }
 
 func (s *Store) UpsertOIDCUser(ctx context.Context, profile oidcUserProfile) (marketUser, error) {
@@ -309,6 +366,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			review_note TEXT NOT NULL DEFAULT '',
 			reviewed_at TEXT NOT NULL DEFAULT '',
 			reviewed_by TEXT NOT NULL DEFAULT '',
+			detail_view_count INTEGER NOT NULL DEFAULT 0,
 			published INTEGER NOT NULL DEFAULT 1,
 			published_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
@@ -466,6 +524,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "items", "reviewed_by", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "items", "detail_view_count", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "versions", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
@@ -1045,8 +1106,7 @@ func (s *Store) ListFavorites(ctx context.Context, userID string) ([]storedItem,
 }
 
 func (s *Store) listItems(ctx context.Context, onlyType ItemType, reviewStatus, viewerUserID string, publicOnly bool, creatorID, favoriteUserID string) ([]storedItem, error) {
-	query := `SELECT type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, published_at, updated_at
-			FROM items`
+	query := `SELECT ` + storedItemSelectColumns + ` FROM items`
 	args := []any{}
 	conditions := []string{}
 	if publicOnly {
@@ -1099,7 +1159,7 @@ func (s *Store) listItems(ctx context.Context, onlyType ItemType, reviewStatus, 
 }
 
 func (s *Store) GetPublic(ctx context.Context, itemType ItemType, id, viewerUserID string) (storedItem, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, published_at, updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT `+storedItemSelectColumns+`
 		FROM items WHERE type = ? AND id = ? AND published = 1 AND review_status = ?`, itemType, id, ReviewStatusApproved)
 	item, err := scanStoredItem(row)
 	if err != nil {
@@ -1121,7 +1181,7 @@ func scanStoredItem(scanner itemScanner) (storedItem, error) {
 	var published int
 	var publishedAt, updatedAt, reviewedAt string
 	var metadataJSON, dependenciesJSON, protocolJSON string
-	if err := scanner.Scan(&item.Type, &item.ID, &item.Name, &item.Description, &item.Readme, &item.LatestVersion, &item.MinDesktopVersion, &item.SandboxKind, &item.WebsiteKind, &item.CreatorID, &metadataJSON, &dependenciesJSON, &protocolJSON, &item.ADPYAML, &item.ReviewStatus, &item.ReviewNote, &reviewedAt, &item.ReviewedBy, &published, &publishedAt, &updatedAt); err != nil {
+	if err := scanner.Scan(&item.Type, &item.ID, &item.Name, &item.Description, &item.Readme, &item.LatestVersion, &item.MinDesktopVersion, &item.SandboxKind, &item.WebsiteKind, &item.CreatorID, &metadataJSON, &dependenciesJSON, &protocolJSON, &item.ADPYAML, &item.ReviewStatus, &item.ReviewNote, &reviewedAt, &item.ReviewedBy, &item.DetailViewCount, &published, &publishedAt, &updatedAt); err != nil {
 		return storedItem{}, err
 	}
 	item.ReviewStatus = normalizeReviewStatus(item.ReviewStatus, ReviewStatusApproved)
@@ -2307,6 +2367,23 @@ func publicItems(items []storedItem) []PublicItem {
 	for _, item := range items {
 		result = append(result, publicItem(item))
 	}
+	return result
+}
+
+func creatorItems(items []storedItem) []CreatorItem {
+	result := make([]CreatorItem, 0, len(items))
+	for _, item := range items {
+		result = append(result, CreatorItem{
+			PublicItem:      publicItem(item),
+			DetailViewCount: item.DetailViewCount,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Type != result[j].Type {
+			return result[i].Type < result[j].Type
+		}
+		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+	})
 	return result
 }
 

@@ -114,6 +114,9 @@ func (a *App) Routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}/download", func(w http.ResponseWriter, r *http.Request) {
 			a.handleMarketDownload(w, r, route.Type)
 		})
+		mux.HandleFunc("POST /api/v1/"+route.Path+"/{id}/view", func(w http.ResponseWriter, r *http.Request) {
+			a.handleMarketDetailView(w, r, route.Type)
+		})
 		if route.Type == TypeSkill {
 			mux.HandleFunc("GET /api/v1/"+route.Path+"/{id}/package/download", a.handleSkillPackageDownload)
 		}
@@ -272,9 +275,11 @@ func (a *App) handleCreatorItems(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	result := publicItems(items)
-	sortPublicItems(result)
-	writeJSON(w, http.StatusOK, CatalogResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC(), Items: result})
+	writeJSON(w, http.StatusOK, CreatorCatalogResponse{
+		SchemaVersion: 1,
+		GeneratedAt:   time.Now().UTC(),
+		Items:         creatorItems(items),
+	})
 }
 
 func (a *App) handleAdminReviews(w http.ResponseWriter, r *http.Request) {
@@ -596,6 +601,19 @@ func (a *App) handleMarketFavorite(w http.ResponseWriter, r *http.Request, itemT
 	writeJSON(w, http.StatusOK, marketItem(item))
 }
 
+func (a *App) handleMarketDetailView(w http.ResponseWriter, r *http.Request, itemType ItemType) {
+	id := sanitizeSlug(r.PathValue("id"))
+	if err := a.store.IncrementDetailViewCount(r.Context(), itemType, id); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	} else if err != nil {
+		log.Printf("detail view increment failed type=%s id=%s: %v", itemType, id, err)
+		writeError(w, http.StatusInternalServerError, "store_error", "unable to record detail view")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a *App) handleMarketComments(w http.ResponseWriter, r *http.Request, itemType ItemType) {
 	id := sanitizeSlug(r.PathValue("id"))
 	item, err := a.store.GetPublic(r.Context(), itemType, id, a.viewerUserID(r))
@@ -762,15 +780,11 @@ func writeCommentMutationResult(w http.ResponseWriter, comment ItemComment, err 
 }
 
 func (a *App) handlePublish(w http.ResponseWriter, r *http.Request) {
-	a.handlePublishWithType(w, r, "")
+	a.handlePublishWithOptions(w, r, "", "", a.viewerUserID(r))
 }
 
 func (a *App) handleTypedPublish(w http.ResponseWriter, r *http.Request, itemType ItemType) {
-	a.handlePublishWithType(w, r, itemType)
-}
-
-func (a *App) handlePublishWithType(w http.ResponseWriter, r *http.Request, forcedType ItemType) {
-	a.handlePublishWithOptions(w, r, forcedType, "", "")
+	a.handlePublishWithOptions(w, r, itemType, "", a.viewerUserID(r))
 }
 
 func (a *App) handleCreatorPublish(w http.ResponseWriter, r *http.Request) {

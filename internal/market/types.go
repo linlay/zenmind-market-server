@@ -279,6 +279,17 @@ type CatalogResponse struct {
 	Items         []PublicItem `json:"items"`
 }
 
+type CreatorItem struct {
+	PublicItem
+	DetailViewCount int64 `json:"detailViewCount"`
+}
+
+type CreatorCatalogResponse struct {
+	SchemaVersion int           `json:"schemaVersion"`
+	GeneratedAt   time.Time     `json:"generatedAt"`
+	Items         []CreatorItem `json:"items"`
+}
+
 type MarketInfo struct {
 	Type                  string   `json:"type"`
 	Route                 string   `json:"route"`
@@ -408,6 +419,7 @@ type storedItem struct {
 	ReviewNote        string
 	ReviewedAt        time.Time
 	ReviewedBy        string
+	DetailViewCount   int64
 	DownloadCount     int
 	FavoriteCount     int
 	Favorited         bool
