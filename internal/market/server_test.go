@@ -1934,6 +1934,84 @@ func TestAuthenticatedAdminPublisherSeesDetailViewsInCreatorCatalog(t *testing.T
 	}
 }
 
+func TestAdminReviewDetailPersistsChecksArtifactsChangesAndHistory(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	path := "/api/v1/admin/skills/publish"
+	publish := func(version, description string) {
+		rec := publishMultipartRecordAt(t, handler, path, PublishRequest{
+			ID:           "review-workbench",
+			Name:         "Review Workbench",
+			Version:      version,
+			Description:  description,
+			ArchiveType:  "zip",
+			ReviewStatus: ReviewStatusApproved,
+		}, zipArchive(t, map[string]string{
+			"review-workbench/SKILL.md":         "# Review Workbench\n",
+			"review-workbench/scripts/setup.sh": "#!/bin/sh\n",
+		}))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("publish %s status = %d body=%s", version, rec.Code, rec.Body.String())
+		}
+	}
+	loadDetail := func() AdminReviewDetail {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/reviews/skill/review-workbench", nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("review detail status = %d body=%s", rec.Code, rec.Body.String())
+		}
+		var detail AdminReviewDetail
+		if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+			t.Fatalf("decode review detail: %v", err)
+		}
+		return detail
+	}
+
+	publish("1.0.0", "first version")
+	detail := loadDetail()
+	if detail.Item.ReviewStatus != ReviewStatusPending {
+		t.Fatalf("review status = %q, want pending", detail.Item.ReviewStatus)
+	}
+	if detail.SubmittedAt.IsZero() {
+		t.Fatal("submittedAt is zero")
+	}
+	if len(detail.ValidationChecks) < 5 {
+		t.Fatalf("validation checks = %+v, want persisted checks", detail.ValidationChecks)
+	}
+	if len(detail.Artifacts) != 1 || len(detail.Artifacts[0].Files) != 2 {
+		t.Fatalf("artifacts = %+v, want archive file inventory", detail.Artifacts)
+	}
+	if len(detail.History) != 1 || detail.History[0].Action != "submitted" {
+		t.Fatalf("history = %+v, want submitted event", detail.History)
+	}
+	if detail.IsUpdate || detail.PreviousVersion != nil {
+		t.Fatalf("first version unexpectedly marked update: %+v", detail.PreviousVersion)
+	}
+
+	applyFixtureReviewStatus(t, handler, path, PublishRequest{ID: "review-workbench", ReviewStatus: ReviewStatusApproved})
+	detail = loadDetail()
+	if len(detail.History) != 2 || detail.History[0].ToStatus != ReviewStatusApproved {
+		t.Fatalf("approved history = %+v", detail.History)
+	}
+
+	publish("2.0.0", "second version")
+	detail = loadDetail()
+	if !detail.IsUpdate || detail.PreviousVersion == nil || detail.PreviousVersion.Version != "1.0.0" {
+		t.Fatalf("previous version = %+v, want 1.0.0", detail.PreviousVersion)
+	}
+	changedVersion := false
+	for _, change := range detail.Changes {
+		if change.Field == "version" && change.Previous == "1.0.0" && change.Current == "2.0.0" {
+			changedVersion = true
+		}
+	}
+	if !changedVersion {
+		t.Fatalf("changes = %+v, want version diff", detail.Changes)
+	}
+}
+
 func TestSSOJWTAdminAuthAndAudienceValidation(t *testing.T) {
 	privateKey, publicKeyPEM := testSSOJWTKey(t)
 	app := newTestAppWithConfig(t, Config{

@@ -144,6 +144,7 @@ func (a *App) Routes() http.Handler {
 	}
 	mux.HandleFunc("POST /api/v1/admin/publish", a.requireAdmin(a.handlePublish))
 	mux.HandleFunc("GET /api/v1/admin/reviews", a.requireAdmin(a.handleAdminReviews))
+	mux.HandleFunc("GET /api/v1/admin/reviews/{type}/{id}", a.requireAdmin(a.handleAdminReviewDetail))
 	mux.HandleFunc("POST /api/v1/admin/reviews/{type}/{id}", a.requireAdmin(a.handleAdminReviewUpdate))
 	mux.HandleFunc("POST /api/v1/admin/unpublish", a.requireAdmin(a.handleUnpublish))
 	mux.HandleFunc("GET /api/v1/admin/comments", a.requireAdmin(a.handleAdminComments))
@@ -301,6 +302,24 @@ func (a *App) handleAdminReviews(w http.ResponseWriter, r *http.Request) {
 	result := publicItems(items)
 	sortPublicItems(result)
 	writeJSON(w, http.StatusOK, CatalogResponse{SchemaVersion: 1, GeneratedAt: time.Now().UTC(), Items: result})
+}
+
+func (a *App) handleAdminReviewDetail(w http.ResponseWriter, r *http.Request) {
+	itemType, err := normalizeItemType(r.PathValue("type"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_type", err.Error())
+		return
+	}
+	detail, err := a.store.GetAdminReviewDetail(r.Context(), itemType, sanitizeSlug(r.PathValue("id")), a.viewerUserID(r))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "not_found", "market item not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 func (a *App) handleAdminReviewUpdate(w http.ResponseWriter, r *http.Request) {
@@ -881,6 +900,7 @@ func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, f
 		writeError(w, http.StatusBadRequest, "invalid_adp", err.Error())
 		return
 	}
+	req.ValidationChecks = buildReviewChecks(req, artifact)
 	if err := a.store.Publish(r.Context(), req, artifact); err != nil {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return

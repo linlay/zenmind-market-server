@@ -105,6 +105,7 @@ type PublishRequest struct {
 	ADPYAML           string              `json:"adpYaml"`
 	ReviewStatus      string              `json:"reviewStatus,omitempty"`
 	CreatorID         string              `json:"-"`
+	ValidationChecks  []ReviewCheck       `json:"-"`
 }
 
 type SkillProfileSpec struct {
@@ -290,6 +291,68 @@ type CreatorCatalogResponse struct {
 	Items         []CreatorItem `json:"items"`
 }
 
+type ReviewCheck struct {
+	Key     string `json:"key"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+type ArtifactFileSummary struct {
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"sizeBytes"`
+	Directory bool   `json:"directory,omitempty"`
+}
+
+type AdminReviewArtifact struct {
+	PlatformKey string                `json:"platformKey"`
+	FileName    string                `json:"fileName"`
+	ArchiveType string                `json:"archiveType"`
+	AssetRole   string                `json:"assetRole"`
+	URL         string                `json:"url"`
+	SHA256      string                `json:"sha256"`
+	Integrity   string                `json:"integrity"`
+	SizeBytes   int64                 `json:"sizeBytes"`
+	Files       []ArtifactFileSummary `json:"files"`
+}
+
+type ReviewEvent struct {
+	ID         int64     `json:"id"`
+	ItemType   string    `json:"itemType"`
+	ItemID     string    `json:"itemId"`
+	Version    string    `json:"version"`
+	Action     string    `json:"action"`
+	FromStatus string    `json:"fromStatus,omitempty"`
+	ToStatus   string    `json:"toStatus"`
+	ActorID    string    `json:"actorId"`
+	Note       string    `json:"note,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+type ReviewFieldChange struct {
+	Field    string `json:"field"`
+	Previous string `json:"previous,omitempty"`
+	Current  string `json:"current,omitempty"`
+}
+
+type ReviewCreator struct {
+	ID       string `json:"id"`
+	Username string `json:"username,omitempty"`
+	Name     string `json:"name,omitempty"`
+}
+
+type AdminReviewDetail struct {
+	Item             PublicItem            `json:"item"`
+	Creator          ReviewCreator         `json:"creator"`
+	SubmittedAt      time.Time             `json:"submittedAt"`
+	IsUpdate         bool                  `json:"isUpdate"`
+	PreviousVersion  *PublicVersion        `json:"previousVersion,omitempty"`
+	ValidationChecks []ReviewCheck         `json:"validationChecks"`
+	Artifacts        []AdminReviewArtifact `json:"artifacts"`
+	Changes          []ReviewFieldChange   `json:"changes"`
+	History          []ReviewEvent         `json:"history"`
+	ADPYAML          string                `json:"adpYaml,omitempty"`
+}
+
 type MarketInfo struct {
 	Type                  string   `json:"type"`
 	Route                 string   `json:"route"`
@@ -404,6 +467,7 @@ type storedItem struct {
 	CreatorUsername   string
 	Published         bool
 	PublishedAt       time.Time
+	SubmittedAt       time.Time
 	UpdatedAt         time.Time
 	Tags              []string
 	Assets            map[string]PublicAsset

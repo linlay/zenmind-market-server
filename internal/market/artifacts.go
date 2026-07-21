@@ -31,6 +31,8 @@ type storedArtifact struct {
 	SHA256      string
 	Integrity   string
 	SizeBytes   int64
+	FileName    string
+	Entries     []ArtifactFileSummary
 }
 
 var safeIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
@@ -256,6 +258,10 @@ func saveAndValidateArtifact(ctx context.Context, storage artifactStorage, publi
 	if err := validateArtifactByType(tempPath, req); err != nil {
 		return nil, err
 	}
+	entries, err := listArchiveEntries(tempPath, req.ArchiveType)
+	if err != nil {
+		return nil, err
+	}
 
 	extension := artifactExtension(req.ArchiveType, header.Filename)
 	relative := filepath.Join(string(req.Type), req.ID, req.Version, fmt.Sprintf("%s-%s%s", req.PlatformKey, shaHex[:12], extension))
@@ -276,7 +282,101 @@ func saveAndValidateArtifact(ctx context.Context, storage artifactStorage, publi
 		SHA256:      shaHex,
 		Integrity:   integrity,
 		SizeBytes:   size,
+		FileName:    filepath.Base(header.Filename),
+		Entries:     entries,
 	}, nil
+}
+
+const maxArtifactReviewEntries = 2000
+
+func listArchiveEntries(filePath, archiveType string) ([]ArtifactFileSummary, error) {
+	lower := strings.ToLower(filePath)
+	entries := make([]ArtifactFileSummary, 0)
+	appendEntry := func(name string, size int64, directory bool) error {
+		if unsafeArchivePath(name) {
+			return fmt.Errorf("archive contains unsafe path %q", name)
+		}
+		if len(entries) >= maxArtifactReviewEntries {
+			return fmt.Errorf("archive contains more than %d entries", maxArtifactReviewEntries)
+		}
+		entries = append(entries, ArtifactFileSummary{Path: strings.Trim(strings.ReplaceAll(name, "\\", "/"), "/"), SizeBytes: size, Directory: directory})
+		return nil
+	}
+	if archiveType == "zip" || archiveType == "skill" || strings.HasSuffix(lower, ".zip") || strings.HasSuffix(lower, ".skill") {
+		reader, err := zip.OpenReader(filePath)
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+		for _, file := range reader.File {
+			if file.UncompressedSize64 > uint64(^uint64(0)>>1) {
+				return nil, fmt.Errorf("archive entry %q is too large", file.Name)
+			}
+			if err := appendEntry(file.Name, int64(file.UncompressedSize64), file.FileInfo().IsDir()); err != nil {
+				return nil, err
+			}
+		}
+		return entries, nil
+	}
+	raw, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer raw.Close()
+	var stream io.Reader = raw
+	if archiveType == "tar.gz" || strings.HasSuffix(lower, ".gz") || strings.HasSuffix(lower, ".tgz") {
+		gzipReader, err := gzip.NewReader(raw)
+		if err != nil {
+			return nil, err
+		}
+		defer gzipReader.Close()
+		stream = gzipReader
+	}
+	tarReader := tar.NewReader(stream)
+	for {
+		header, err := tarReader.Next()
+		if errors.Is(err, io.EOF) {
+			return entries, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := appendEntry(header.Name, header.Size, header.FileInfo().IsDir()); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func buildReviewChecks(req PublishRequest, artifact *storedArtifact) []ReviewCheck {
+	checks := []ReviewCheck{
+		{Key: "metadata", Status: "passed", Message: "Component metadata is valid."},
+		{Key: "version", Status: "passed", Message: "Component version is valid."},
+		{Key: "dependencies", Status: "passed", Message: "Dependencies satisfy the market contract."},
+	}
+	if artifact != nil {
+		checks = append(checks,
+			ReviewCheck{Key: "artifact", Status: "passed", Message: "Artifact archive and required files are valid."},
+			ReviewCheck{Key: "checksum", Status: "passed", Message: "Artifact SHA-256 and integrity hashes were generated."},
+		)
+	} else {
+		checks = append(checks, ReviewCheck{Key: "artifact", Status: "info", Message: "This component type does not require an uploaded artifact."})
+	}
+	if strings.TrimSpace(req.ADPYAML) != "" {
+		checks = append(checks, ReviewCheck{Key: "adp", Status: "passed", Message: "ADP manifest passed schema and hook validation."})
+	}
+	if req.Type == TypeWebsiteApp && req.WebsiteKind == WebsiteKindExternal {
+		checks = append(checks, ReviewCheck{Key: "external-url", Status: "warning", Message: "External website URL requires manual review."})
+	}
+	if scriptSpecHasContent(req.Install) || scriptSpecHasContent(req.Uninstall) || (req.Platform != nil && (scriptSpecHasContent(req.Platform.Install) || scriptSpecHasContent(req.Platform.Uninstall))) {
+		checks = append(checks, ReviewCheck{Key: "scripts", Status: "warning", Message: "Install or uninstall scripts require manual review."})
+	}
+	for _, dependency := range req.Dependencies {
+		if dependency.Kind == DependencySystemCommand || dependency.Kind == DependencyDesktopCapability {
+			checks = append(checks, ReviewCheck{Key: "privileged-dependency", Status: "warning", Message: "System commands or desktop capabilities require manual review."})
+			break
+		}
+	}
+	return checks
 }
 
 func saveMarketImage(ctx context.Context, storage artifactStorage, publicBaseURL string, req PublishRequest, file multipart.File, header *multipart.FileHeader) (string, error) {

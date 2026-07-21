@@ -25,7 +25,7 @@ type Store struct {
 const storedItemSelectColumns = `type, id, name, description, readme, latest_version,
 	min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json,
 	dependencies_json, protocol_json, adp_yaml, review_status, review_note,
-	reviewed_at, reviewed_by, detail_view_count, published, published_at, updated_at`
+	reviewed_at, reviewed_by, detail_view_count, published, submitted_at, published_at, updated_at`
 
 var (
 	errCommentForbidden = errors.New("comment belongs to another user")
@@ -368,6 +368,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			reviewed_by TEXT NOT NULL DEFAULT '',
 			detail_view_count INTEGER NOT NULL DEFAULT 0,
 			published INTEGER NOT NULL DEFAULT 1,
+			submitted_at TEXT NOT NULL DEFAULT '',
 			published_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			PRIMARY KEY (type, id)
@@ -387,7 +388,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			review_note TEXT NOT NULL DEFAULT '',
 			reviewed_at TEXT NOT NULL DEFAULT '',
 			reviewed_by TEXT NOT NULL DEFAULT '',
+			validation_json TEXT NOT NULL DEFAULT '[]',
 			published INTEGER NOT NULL DEFAULT 1,
+			submitted_at TEXT NOT NULL DEFAULT '',
 			published_at TEXT NOT NULL,
 			PRIMARY KEY (item_type, item_id, version)
 		)`,
@@ -398,11 +401,13 @@ func (s *Store) migrate(ctx context.Context) error {
 			platform_key TEXT NOT NULL,
 			archive_type TEXT NOT NULL,
 			asset_role TEXT NOT NULL DEFAULT 'primary',
+			original_filename TEXT NOT NULL DEFAULT '',
 			path TEXT NOT NULL,
 			url TEXT NOT NULL,
 			sha256 TEXT NOT NULL,
 			integrity TEXT NOT NULL,
 			size_bytes INTEGER NOT NULL,
+			contents_json TEXT NOT NULL DEFAULT '[]',
 			created_at TEXT NOT NULL,
 			PRIMARY KEY (item_type, item_id, version, platform_key)
 		)`,
@@ -480,6 +485,18 @@ func (s *Store) migrate(ctx context.Context) error {
 			sort_order INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (package_type, package_id, skill_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS review_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			item_type TEXT NOT NULL,
+			item_id TEXT NOT NULL,
+			version TEXT NOT NULL,
+			action TEXT NOT NULL,
+			from_status TEXT NOT NULL DEFAULT '',
+			to_status TEXT NOT NULL,
+			actor_id TEXT NOT NULL DEFAULT '',
+			note TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_download_events_item ON download_events (item_type, item_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_favorite_items_item ON favorite_items (item_type, item_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_item_comments_item ON item_comments (item_type, item_id, status, created_at DESC)`,
@@ -487,6 +504,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_user_identities_user ON user_identities (user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles (user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_skill_profiles_category ON skill_profiles (kind, category)`,
+		`CREATE INDEX IF NOT EXISTS idx_review_events_item ON review_events (item_type, item_id, created_at DESC)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -529,6 +547,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "items", "detail_view_count", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "items", "submitted_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "versions", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
 		return err
 	}
@@ -556,6 +577,12 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "versions", "reviewed_by", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "versions", "validation_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "versions", "submitted_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_items_creator ON items (creator_id)`); err != nil {
 		return err
 	}
@@ -563,6 +590,18 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "artifacts", "asset_role", "TEXT NOT NULL DEFAULT 'primary'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "artifacts", "original_filename", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "artifacts", "contents_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE items SET submitted_at = published_at WHERE submitted_at = ''`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE versions SET submitted_at = published_at WHERE submitted_at = ''`); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE items SET type = ? WHERE type = ?`, TypeSandboxImage, "sandbox"); err != nil {
@@ -810,6 +849,10 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 	if err != nil {
 		return err
 	}
+	validationJSON, err := encodeJSONText(req.ValidationChecks, "[]")
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -821,9 +864,11 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 	}()
 
 	creatorID := strings.TrimSpace(req.CreatorID)
+	priorStatus := ""
+	_ = tx.QueryRowContext(ctx, `SELECT review_status FROM items WHERE type = ? AND id = ?`, req.Type, req.ID).Scan(&priorStatus)
 	if _, err = tx.ExecContext(ctx, `INSERT INTO items (
-			type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, published_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+			type, id, name, description, readme, latest_version, min_desktop_version, sandbox_kind, website_kind, creator_id, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, submitted_at, published_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(type, id) DO UPDATE SET
 			name = excluded.name,
 			description = excluded.description,
@@ -842,13 +887,14 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 		reviewed_at = excluded.reviewed_at,
 		reviewed_by = excluded.reviewed_by,
 		published = excluded.published,
+		submitted_at = excluded.submitted_at,
 		updated_at = excluded.updated_at`,
-		req.Type, req.ID, req.Name, req.Description, req.Readme, req.Version, req.MinDesktopVersion, req.SandboxKind, req.WebsiteKind, creatorID, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), reviewStatus, reviewedAt, reviewedBy, published, now, now); err != nil {
+		req.Type, req.ID, req.Name, req.Description, req.Readme, req.Version, req.MinDesktopVersion, req.SandboxKind, req.WebsiteKind, creatorID, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), reviewStatus, reviewedAt, reviewedBy, published, now, now, now); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO versions (
-			item_type, item_id, version, creator_id, description, readme, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, published, published_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
+			item_type, item_id, version, creator_id, description, readme, metadata_json, dependencies_json, protocol_json, adp_yaml, review_status, review_note, reviewed_at, reviewed_by, validation_json, published, submitted_at, published_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(item_type, item_id, version) DO UPDATE SET
 			creator_id = excluded.creator_id,
 			description = excluded.description,
@@ -861,8 +907,10 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 		review_note = excluded.review_note,
 		reviewed_at = excluded.reviewed_at,
 		reviewed_by = excluded.reviewed_by,
-		published = excluded.published`,
-		req.Type, req.ID, req.Version, creatorID, req.Description, req.Readme, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), reviewStatus, reviewedAt, reviewedBy, published, now); err != nil {
+		validation_json = excluded.validation_json,
+		published = excluded.published,
+		submitted_at = excluded.submitted_at`,
+		req.Type, req.ID, req.Version, creatorID, req.Description, req.Readme, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), reviewStatus, reviewedAt, reviewedBy, validationJSON, published, now, now); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO version_platforms (
@@ -938,21 +986,32 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 		}
 	}
 	if artifact != nil {
+		contentsJSON, encodeErr := encodeJSONText(artifact.Entries, "[]")
+		if encodeErr != nil {
+			return encodeErr
+		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO artifacts (
-			item_type, item_id, version, platform_key, archive_type, asset_role, path, url, sha256, integrity, size_bytes, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			item_type, item_id, version, platform_key, archive_type, asset_role, original_filename, path, url, sha256, integrity, size_bytes, contents_json, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(item_type, item_id, version, platform_key) DO UPDATE SET
 			archive_type = excluded.archive_type,
 			asset_role = excluded.asset_role,
+			original_filename = excluded.original_filename,
 			path = excluded.path,
 			url = excluded.url,
 			sha256 = excluded.sha256,
 			integrity = excluded.integrity,
 			size_bytes = excluded.size_bytes,
+			contents_json = excluded.contents_json,
 			created_at = excluded.created_at`,
-			req.Type, req.ID, req.Version, artifact.PlatformKey, artifact.ArchiveType, artifact.AssetRole, artifact.Path, artifact.URL, artifact.SHA256, artifact.Integrity, artifact.SizeBytes, now); err != nil {
+			req.Type, req.ID, req.Version, artifact.PlatformKey, artifact.ArchiveType, artifact.AssetRole, artifact.FileName, artifact.Path, artifact.URL, artifact.SHA256, artifact.Integrity, artifact.SizeBytes, contentsJSON, now); err != nil {
 			return err
 		}
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO review_events (
+		item_type, item_id, version, action, from_status, to_status, actor_id, note, created_at
+	) VALUES (?, ?, ?, 'submitted', ?, ?, ?, '', ?)`, req.Type, req.ID, req.Version, priorStatus, reviewStatus, creatorID, now); err != nil {
+		return err
 	}
 	err = tx.Commit()
 	return err
@@ -1068,7 +1127,16 @@ func (s *Store) UpdateReview(ctx context.Context, itemType ItemType, id, status,
 	if status == ReviewStatusApproved {
 		published = 1
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE items SET review_status = ?, review_note = ?, reviewed_at = ?, reviewed_by = ?, published = ?, updated_at = ? WHERE type = ? AND id = ?`,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var fromStatus, version string
+	if err = tx.QueryRowContext(ctx, `SELECT review_status, latest_version FROM items WHERE type = ? AND id = ?`, itemType, id).Scan(&fromStatus, &version); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE items SET review_status = ?, review_note = ?, reviewed_at = ?, reviewed_by = ?, published = ?, updated_at = ? WHERE type = ? AND id = ?`,
 		status, strings.TrimSpace(note), now, reviewer, published, now, itemType, id)
 	if err != nil {
 		return err
@@ -1080,9 +1148,16 @@ func (s *Store) UpdateReview(ctx context.Context, itemType ItemType, id, status,
 	if affected == 0 {
 		return sql.ErrNoRows
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE versions SET review_status = ?, review_note = ?, reviewed_at = ?, reviewed_by = ?, published = ? WHERE item_type = ? AND item_id = ? AND version = (SELECT latest_version FROM items WHERE type = ? AND id = ?)`,
-		status, strings.TrimSpace(note), now, reviewer, published, itemType, id, itemType, id)
-	return err
+	if _, err = tx.ExecContext(ctx, `UPDATE versions SET review_status = ?, review_note = ?, reviewed_at = ?, reviewed_by = ?, published = ? WHERE item_type = ? AND item_id = ? AND version = ?`,
+		status, strings.TrimSpace(note), now, reviewer, published, itemType, id, version); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO review_events (
+		item_type, item_id, version, action, from_status, to_status, actor_id, note, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, itemType, id, version, status, fromStatus, status, reviewer, strings.TrimSpace(note), now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ListPublic(ctx context.Context, onlyType ItemType, viewerUserID string) ([]storedItem, error) {
@@ -1172,6 +1247,146 @@ func (s *Store) GetPublic(ctx context.Context, itemType ItemType, id, viewerUser
 	return items[0], nil
 }
 
+func (s *Store) GetAdmin(ctx context.Context, itemType ItemType, id, viewerUserID string) (storedItem, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+storedItemSelectColumns+` FROM items WHERE type = ? AND id = ?`, itemType, id)
+	item, err := scanStoredItem(row)
+	if err != nil {
+		return storedItem{}, err
+	}
+	items := []storedItem{item}
+	if err := s.hydrateItems(ctx, items, itemType, viewerUserID, false); err != nil {
+		return storedItem{}, err
+	}
+	return items[0], nil
+}
+
+func (s *Store) GetAdminReviewDetail(ctx context.Context, itemType ItemType, id, viewerUserID string) (AdminReviewDetail, error) {
+	item, err := s.GetAdmin(ctx, itemType, id, viewerUserID)
+	if err != nil {
+		return AdminReviewDetail{}, err
+	}
+	detail := AdminReviewDetail{
+		Item:        publicItem(item),
+		Creator:     ReviewCreator{ID: item.CreatorID, Username: item.CreatorUsername, Name: item.CreatorName},
+		SubmittedAt: item.SubmittedAt,
+		ADPYAML:     item.ADPYAML,
+	}
+	if detail.SubmittedAt.IsZero() {
+		detail.SubmittedAt = item.PublishedAt
+	}
+	var validationJSON string
+	if err := s.db.QueryRowContext(ctx, `SELECT validation_json FROM versions WHERE item_type = ? AND item_id = ? AND version = ?`, itemType, id, item.LatestVersion).Scan(&validationJSON); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return AdminReviewDetail{}, err
+	}
+	if validationJSON != "" {
+		if err := decodeJSONText(validationJSON, &detail.ValidationChecks); err != nil {
+			return AdminReviewDetail{}, err
+		}
+	}
+	if detail.ValidationChecks == nil {
+		detail.ValidationChecks = []ReviewCheck{}
+	}
+	artifacts, err := s.listAdminReviewArtifacts(ctx, itemType, id, item.LatestVersion)
+	if err != nil {
+		return AdminReviewDetail{}, err
+	}
+	detail.Artifacts = artifacts
+	history, err := s.listReviewEvents(ctx, itemType, id)
+	if err != nil {
+		return AdminReviewDetail{}, err
+	}
+	detail.History = history
+	versions, err := s.ListVersions(ctx, itemType, id)
+	if err != nil {
+		return AdminReviewDetail{}, err
+	}
+	for index := range versions {
+		if versions[index].Version == item.LatestVersion {
+			continue
+		}
+		detail.PreviousVersion = &versions[index]
+		detail.IsUpdate = true
+		break
+	}
+	if detail.PreviousVersion != nil {
+		detail.Changes = reviewFieldChanges(item, *detail.PreviousVersion)
+	} else {
+		detail.Changes = []ReviewFieldChange{}
+	}
+	return detail, nil
+}
+
+func (s *Store) listAdminReviewArtifacts(ctx context.Context, itemType ItemType, id, version string) ([]AdminReviewArtifact, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT platform_key, original_filename, archive_type, asset_role, url, sha256, integrity, size_bytes, contents_json
+		FROM artifacts WHERE item_type = ? AND item_id = ? AND version = ? ORDER BY asset_role, platform_key`, itemType, id, version)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	artifacts := []AdminReviewArtifact{}
+	for rows.Next() {
+		var artifact AdminReviewArtifact
+		var contentsJSON string
+		if err := rows.Scan(&artifact.PlatformKey, &artifact.FileName, &artifact.ArchiveType, &artifact.AssetRole, &artifact.URL, &artifact.SHA256, &artifact.Integrity, &artifact.SizeBytes, &contentsJSON); err != nil {
+			return nil, err
+		}
+		if err := decodeJSONText(contentsJSON, &artifact.Files); err != nil {
+			return nil, err
+		}
+		if artifact.Files == nil {
+			artifact.Files = []ArtifactFileSummary{}
+		}
+		artifacts = append(artifacts, artifact)
+	}
+	return artifacts, rows.Err()
+}
+
+func (s *Store) listReviewEvents(ctx context.Context, itemType ItemType, id string) ([]ReviewEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, item_type, item_id, version, action, from_status, to_status, actor_id, note, created_at
+		FROM review_events WHERE item_type = ? AND item_id = ? ORDER BY created_at DESC, id DESC`, itemType, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := []ReviewEvent{}
+	for rows.Next() {
+		var event ReviewEvent
+		var createdAt string
+		if err := rows.Scan(&event.ID, &event.ItemType, &event.ItemID, &event.Version, &event.Action, &event.FromStatus, &event.ToStatus, &event.ActorID, &event.Note, &createdAt); err != nil {
+			return nil, err
+		}
+		event.CreatedAt = parseTime(createdAt)
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+func reviewFieldChanges(item storedItem, previous PublicVersion) []ReviewFieldChange {
+	candidates := []ReviewFieldChange{
+		{Field: "version", Previous: previous.Version, Current: item.LatestVersion},
+		{Field: "description", Previous: previous.Description, Current: item.Description},
+		{Field: "readme", Previous: previous.Readme, Current: item.Readme},
+		{Field: "metadata", Previous: reviewValue(previous.Metadata), Current: reviewValue(item.Metadata)},
+		{Field: "dependencies", Previous: reviewValue(previous.Dependencies), Current: reviewValue(item.Dependencies)},
+		{Field: "platforms", Previous: reviewValue(previous.Platforms), Current: reviewValue(item.Platforms)},
+	}
+	changes := make([]ReviewFieldChange, 0, len(candidates))
+	for _, change := range candidates {
+		if change.Previous != change.Current {
+			changes = append(changes, change)
+		}
+	}
+	return changes
+}
+
+func reviewValue(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
 type itemScanner interface {
 	Scan(dest ...any) error
 }
@@ -1179,14 +1394,18 @@ type itemScanner interface {
 func scanStoredItem(scanner itemScanner) (storedItem, error) {
 	var item storedItem
 	var published int
-	var publishedAt, updatedAt, reviewedAt string
+	var submittedAt, publishedAt, updatedAt, reviewedAt string
 	var metadataJSON, dependenciesJSON, protocolJSON string
-	if err := scanner.Scan(&item.Type, &item.ID, &item.Name, &item.Description, &item.Readme, &item.LatestVersion, &item.MinDesktopVersion, &item.SandboxKind, &item.WebsiteKind, &item.CreatorID, &metadataJSON, &dependenciesJSON, &protocolJSON, &item.ADPYAML, &item.ReviewStatus, &item.ReviewNote, &reviewedAt, &item.ReviewedBy, &item.DetailViewCount, &published, &publishedAt, &updatedAt); err != nil {
+	if err := scanner.Scan(&item.Type, &item.ID, &item.Name, &item.Description, &item.Readme, &item.LatestVersion, &item.MinDesktopVersion, &item.SandboxKind, &item.WebsiteKind, &item.CreatorID, &metadataJSON, &dependenciesJSON, &protocolJSON, &item.ADPYAML, &item.ReviewStatus, &item.ReviewNote, &reviewedAt, &item.ReviewedBy, &item.DetailViewCount, &published, &submittedAt, &publishedAt, &updatedAt); err != nil {
 		return storedItem{}, err
 	}
 	item.ReviewStatus = normalizeReviewStatus(item.ReviewStatus, ReviewStatusApproved)
 	item.Published = published == 1
 	item.PublishedAt = parseTime(publishedAt)
+	item.SubmittedAt = parseTime(submittedAt)
+	if item.SubmittedAt.IsZero() {
+		item.SubmittedAt = item.PublishedAt
+	}
 	item.UpdatedAt = parseTime(updatedAt)
 	item.ReviewedAt = parseTime(reviewedAt)
 	if err := decodeItemJSON(&item, metadataJSON, dependenciesJSON, protocolJSON); err != nil {
