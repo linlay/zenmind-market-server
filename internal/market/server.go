@@ -780,11 +780,11 @@ func writeCommentMutationResult(w http.ResponseWriter, comment ItemComment, err 
 }
 
 func (a *App) handlePublish(w http.ResponseWriter, r *http.Request) {
-	a.handlePublishWithOptions(w, r, "", "", a.viewerUserID(r))
+	a.handlePublishWithOptions(w, r, "", ReviewStatusPending, a.viewerUserID(r))
 }
 
 func (a *App) handleTypedPublish(w http.ResponseWriter, r *http.Request, itemType ItemType) {
-	a.handlePublishWithOptions(w, r, itemType, "", a.viewerUserID(r))
+	a.handlePublishWithOptions(w, r, itemType, ReviewStatusPending, a.viewerUserID(r))
 }
 
 func (a *App) handleCreatorPublish(w http.ResponseWriter, r *http.Request) {

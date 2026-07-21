@@ -1259,6 +1259,7 @@ func TestVersionCanonicalizationAtAPIBoundaries(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"version":"1.0.0"`) {
 		t.Fatalf("publish response did not return canonical version: %s", rec.Body.String())
 	}
+	applyFixtureReviewStatus(t, handler, "/api/v1/admin/plugins/publish", PublishRequest{ID: "calendar"})
 
 	publishMultipartAt(t, handler, "/api/v1/admin/pets/publish", PublishRequest{
 		ID:          "spark",
@@ -1880,6 +1881,31 @@ func TestAuthenticatedAdminPublisherSeesDetailViewsInCreatorCatalog(t *testing.T
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/reviews?status=pending", nil)
+	setProxyUserWithRole(req, "reviewer-admin", "admin")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin pending reviews status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var pending CatalogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &pending); err != nil {
+		t.Fatalf("decode pending reviews: %v", err)
+	}
+	if len(pending.Items) != 1 || pending.Items[0].ID != "admin-owned-app" || pending.Items[0].ReviewStatus != ReviewStatusPending {
+		t.Fatalf("pending reviews = %+v, want admin-owned-app pending", pending.Items)
+	}
+
+	rawReview, _ := json.Marshal(map[string]string{"status": ReviewStatusApproved})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/reviews/website-app/admin-owned-app", bytes.NewReader(rawReview))
+	setProxyUserWithRole(req, "reviewer-admin", "admin")
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin review status = %d body=%s", rec.Code, rec.Body.String())
 	}
 
 	rec = httptest.NewRecorder()
@@ -3121,6 +3147,9 @@ func publishMultipartAt(t *testing.T, handler http.Handler, path string, metadat
 	if rec.Code != wantStatus {
 		t.Fatalf("publish %s status = %d, want %d body=%s", path, rec.Code, wantStatus, rec.Body.String())
 	}
+	if wantStatus == http.StatusOK {
+		applyFixtureReviewStatus(t, handler, path, metadata)
+	}
 }
 
 func publishMultipartRecordAt(t *testing.T, handler http.Handler, path string, metadata PublishRequest, archive []byte) *httptest.ResponseRecorder {
@@ -3172,6 +3201,42 @@ func publishJSON(t *testing.T, handler http.Handler, path string, metadata Publi
 	handler.ServeHTTP(rec, req)
 	if rec.Code != wantStatus {
 		t.Fatalf("publish JSON %s status = %d, want %d body=%s", path, rec.Code, wantStatus, rec.Body.String())
+	}
+	if wantStatus == http.StatusOK {
+		applyFixtureReviewStatus(t, handler, path, metadata)
+	}
+}
+
+// Most tests need a public fixture rather than exercising the review workflow.
+// Production admin publish routes always create a pending item; this helper
+// applies the review status requested by the fixture as a separate admin action.
+func applyFixtureReviewStatus(t *testing.T, handler http.Handler, publishPath string, metadata PublishRequest) {
+	t.Helper()
+	if !strings.Contains(publishPath, "/api/v1/admin/") {
+		return
+	}
+	itemType := metadata.Type
+	if itemType == "" {
+		for _, route := range marketRouteDefinitions() {
+			if publishPath == "/api/v1/admin/"+route.Path+"/publish" {
+				itemType = route.Type
+				break
+			}
+		}
+	}
+	id := sanitizeSlug(metadata.ID)
+	if itemType == "" || id == "" {
+		return
+	}
+	status := normalizeReviewStatus(metadata.ReviewStatus, ReviewStatusApproved)
+	rawReview, _ := json.Marshal(map[string]string{"status": status})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/reviews/"+string(itemType)+"/"+id, bytes.NewReader(rawReview))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("review fixture %s:%s status = %d body=%s", itemType, id, rec.Code, rec.Body.String())
 	}
 }
 
