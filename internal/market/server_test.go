@@ -2012,6 +2012,114 @@ func TestAdminReviewDetailPersistsChecksArtifactsChangesAndHistory(t *testing.T)
 	}
 }
 
+func TestCreatorVersionUpdateKeepsActiveReleaseOnlineUntilApproval(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publish := func(userID, version, description string) *httptest.ResponseRecorder {
+		t.Helper()
+		raw, _ := json.Marshal(PublishRequest{
+			Type: TypeWebsiteApp, ID: "stable-release", Name: "Stable Release", Version: version,
+			Description: description, WebsiteKind: WebsiteKindExternal,
+			Metadata: map[string]string{"url": "https://example.test/stable-release"},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/creator/publish", bytes.NewReader(raw))
+		setProxyUser(req, userID)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	review := func(status string) *httptest.ResponseRecorder {
+		t.Helper()
+		raw, _ := json.Marshal(map[string]string{"status": status, "note": "reviewed"})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/reviews/website-app/stable-release", bytes.NewReader(raw))
+		setProxyUserWithRole(req, "reviewer", "admin")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	catalogItem := func() PublicItem {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/catalog?type=website-app", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("catalog status = %d body=%s", rec.Code, rec.Body.String())
+		}
+		var response CatalogResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode catalog: %v", err)
+		}
+		if len(response.Items) != 1 {
+			t.Fatalf("catalog items = %+v, want one", response.Items)
+		}
+		return response.Items[0]
+	}
+
+	if rec := publish("creator-a", "1.0.0", "active v1"); rec.Code != http.StatusOK {
+		t.Fatalf("initial publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := review(ReviewStatusApproved); rec.Code != http.StatusOK {
+		t.Fatalf("initial review status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if item := catalogItem(); item.Version != "1.0.0" || item.Description != "active v1" {
+		t.Fatalf("initial catalog item = %+v", item)
+	}
+
+	if rec := publish("creator-a", "1.1.0", "candidate v1.1"); rec.Code != http.StatusOK {
+		t.Fatalf("update publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if item := catalogItem(); item.Version != "1.0.0" || item.Description != "active v1" {
+		t.Fatalf("catalog changed before approval: %+v", item)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/reviews?status=pending", nil)
+	setProxyUserWithRole(req, "reviewer", "admin")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var pendingResponse CatalogResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &pendingResponse) != nil || len(pendingResponse.Items) != 1 || pendingResponse.Items[0].Version != "1.1.0" {
+		t.Fatalf("pending admin reviews status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/creator/items", nil)
+	setProxyUser(req, "creator-a")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var creatorResponse CreatorCatalogResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &creatorResponse) != nil || len(creatorResponse.Items) != 1 {
+		t.Fatalf("creator items status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := creatorResponse.Items[0]; got.Version != "1.0.0" || got.PendingVersion != "1.1.0" || got.PendingReviewStatus != ReviewStatusPending {
+		t.Fatalf("creator release state = %+v", got)
+	}
+
+	if rec := publish("creator-b", "1.2.0", "hijack"); rec.Code != http.StatusForbidden {
+		t.Fatalf("other creator publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := publish("creator-a", "1.2.0", "parallel candidate"); rec.Code != http.StatusConflict {
+		t.Fatalf("parallel publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := review(ReviewStatusApproved); rec.Code != http.StatusOK {
+		t.Fatalf("update review status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if item := catalogItem(); item.Version != "1.1.0" || item.Description != "candidate v1.1" {
+		t.Fatalf("approved catalog item = %+v", item)
+	}
+	if rec := publish("creator-a", "1.1.0", "same version"); rec.Code != http.StatusConflict {
+		t.Fatalf("same version publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := publish("creator-a", "1.2.0", "candidate to reject"); rec.Code != http.StatusOK {
+		t.Fatalf("rejected candidate publish status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := review(ReviewStatusRejected); rec.Code != http.StatusOK {
+		t.Fatalf("rejected candidate review status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if item := catalogItem(); item.Version != "1.1.0" || item.Description != "candidate v1.1" {
+		t.Fatalf("rejection changed active catalog item: %+v", item)
+	}
+}
+
 func TestSSOJWTAdminAuthAndAudienceValidation(t *testing.T) {
 	privateKey, publicKeyPEM := testSSOJWTKey(t)
 	app := newTestAppWithConfig(t, Config{

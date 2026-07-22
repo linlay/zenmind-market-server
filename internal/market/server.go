@@ -276,10 +276,15 @@ func (a *App) handleCreatorItems(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
+	submissions, err := a.store.CreatorSubmissionStates(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, CreatorCatalogResponse{
 		SchemaVersion: 1,
 		GeneratedAt:   time.Now().UTC(),
-		Items:         creatorItems(items),
+		Items:         creatorItems(items, submissions),
 	})
 }
 
@@ -842,6 +847,10 @@ func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, f
 			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
 			return
 		}
+		if err := a.store.ValidateRelease(r.Context(), req.Type, req.ID, req.Version, creatorID); err != nil {
+			writePublishStoreError(w, err)
+			return
+		}
 		imageFile, imageHeader, imageErr := r.FormFile("image")
 		if imageErr == nil {
 			defer imageFile.Close()
@@ -881,6 +890,10 @@ func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, f
 			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
 			return
 		}
+		if err := a.store.ValidateRelease(r.Context(), req.Type, req.ID, req.Version, creatorID); err != nil {
+			writePublishStoreError(w, err)
+			return
+		}
 	}
 	if err := validateArtifactRequirement(req, artifact != nil); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_artifact", err.Error())
@@ -902,10 +915,25 @@ func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, f
 	}
 	req.ValidationChecks = buildReviewChecks(req, artifact)
 	if err := a.store.Publish(r.Context(), req, artifact); err != nil {
-		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		writePublishStoreError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "item": map[string]any{"type": req.Type, "id": req.ID, "version": req.Version}})
+}
+
+func writePublishStoreError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errPublishForbidden):
+		writeError(w, http.StatusForbidden, "component_forbidden", err.Error())
+	case errors.Is(err, errVersionNotNewer):
+		writeError(w, http.StatusConflict, "version_not_newer", err.Error())
+	case errors.Is(err, errPendingReleaseExists):
+		writeError(w, http.StatusConflict, "pending_release_exists", err.Error())
+	case errors.Is(err, errPublishedVersionExists):
+		writeError(w, http.StatusConflict, "version_exists", err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+	}
 }
 
 func (a *App) handleADPManifest(w http.ResponseWriter, r *http.Request) {

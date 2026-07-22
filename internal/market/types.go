@@ -282,7 +282,11 @@ type CatalogResponse struct {
 
 type CreatorItem struct {
 	PublicItem
-	DetailViewCount int64 `json:"detailViewCount"`
+	DetailViewCount     int64      `json:"detailViewCount"`
+	PendingVersion      string     `json:"pendingVersion,omitempty"`
+	PendingReviewStatus string     `json:"pendingReviewStatus,omitempty"`
+	PendingReviewNote   string     `json:"pendingReviewNote,omitempty"`
+	PendingSubmittedAt  *time.Time `json:"pendingSubmittedAt,omitempty"`
 }
 
 type CreatorCatalogResponse struct {
