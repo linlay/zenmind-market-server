@@ -34,6 +34,7 @@ var (
 	errVersionNotNewer        = errors.New("new version must be greater than the active version")
 	errPendingReleaseExists   = errors.New("component already has a version pending review")
 	errPublishedVersionExists = errors.New("version has already been published")
+	errVersionSnapshotMissing = errors.New("version snapshot is incomplete and cannot be safely restored")
 )
 
 type versionCandidate struct {
@@ -47,7 +48,18 @@ type versionCandidate struct {
 	ReviewedBy  string
 	ReviewedAt  time.Time
 	SubmittedAt time.Time
+	PublishedAt time.Time
 	UpdatedAt   time.Time
+}
+
+type versionActivation struct {
+	ReviewStatus string
+	ReviewNote   string
+	ReviewedAt   string
+	ReviewedBy   string
+	SubmittedAt  string
+	PublishedAt  string
+	UpdatedAt    string
 }
 
 type creatorSubmissionState struct {
@@ -647,6 +659,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.backfillVersionPlatforms(ctx); err != nil {
 		return err
 	}
+	if err := s.backfillCurrentVersionSnapshots(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -828,6 +843,116 @@ func (s *Store) ensureColumn(ctx context.Context, table, column, definition stri
 	}
 	_, err = s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, definition))
 	return err
+}
+
+// backfillCurrentVersionSnapshots makes the current release of every legacy
+// item fully restorable. Older non-current releases cannot be reconstructed
+// without inventing historical tags or skill metadata, so they remain empty
+// and Unpublish refuses to activate them.
+func (s *Store) backfillCurrentVersionSnapshots(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT i.type, i.id, i.name, i.description, i.readme, i.latest_version,
+		i.min_desktop_version, i.sandbox_kind, i.website_kind, i.creator_id, i.metadata_json,
+		i.dependencies_json, i.protocol_json, i.adp_yaml, i.review_status, i.review_note,
+		i.reviewed_at, i.reviewed_by, i.detail_view_count, i.published, i.submitted_at, i.published_at, i.updated_at
+		FROM items i JOIN versions v ON v.item_type = i.type AND v.item_id = i.id AND v.version = i.latest_version
+		WHERE v.snapshot_json IS NULL OR v.snapshot_json = ''`)
+	if err != nil {
+		return err
+	}
+	items := []storedItem{}
+	for rows.Next() {
+		item, scanErr := scanStoredItem(rows)
+		if scanErr != nil {
+			_ = rows.Close()
+			return scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(items) > 0 {
+		if err := s.loadTagsForItems(ctx, items, "", false); err != nil {
+			return err
+		}
+		if err := s.loadPlatformsForItems(ctx, items, "", false); err != nil {
+			return err
+		}
+		if err := s.loadSkillProfilesForItems(ctx, items, "", false); err != nil {
+			return err
+		}
+	}
+	for _, item := range items {
+		req := publishRequestFromStoredItem(item)
+		snapshotJSON, err := encodeJSONText(req, "{}")
+		if err != nil {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE versions SET snapshot_json = ?
+			WHERE item_type = ? AND item_id = ? AND version = ? AND (snapshot_json IS NULL OR snapshot_json = '')`,
+			snapshotJSON, item.Type, item.ID, item.LatestVersion); err != nil {
+			return err
+		}
+	}
+	var incomplete int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM items i
+		LEFT JOIN versions v ON v.item_type = i.type AND v.item_id = i.id AND v.version = i.latest_version
+		WHERE v.version IS NULL OR v.snapshot_json IS NULL OR v.snapshot_json = ''`).Scan(&incomplete); err != nil {
+		return err
+	}
+	if incomplete > 0 {
+		return fmt.Errorf("%w: %d current releases could not be backfilled", errVersionSnapshotMissing, incomplete)
+	}
+	return nil
+}
+
+func publishRequestFromStoredItem(item storedItem) PublishRequest {
+	req := PublishRequest{
+		Type: item.Type, ID: item.ID, Name: item.Name, Version: item.LatestVersion,
+		Description: item.Description, Readme: item.Readme, Tags: append([]string(nil), item.Tags...),
+		MinDesktopVersion: item.MinDesktopVersion, SandboxKind: item.SandboxKind, WebsiteKind: item.WebsiteKind,
+		Metadata: storageMetadata(item.Metadata), Dependencies: append([]MarketDependency(nil), item.Dependencies...),
+		Install: item.Install, Uninstall: item.Uninstall, Detect: item.Detect, ADPYAML: item.ADPYAML,
+		ReviewStatus: item.ReviewStatus, CreatorID: item.CreatorID,
+	}
+	if item.Skill != nil {
+		req.Skill = &SkillProfileSpec{
+			Kind: item.Skill.Kind, Category: item.Skill.Category, Scenario: item.Skill.Scenario,
+			Level: item.Skill.Level, PackageMode: item.Skill.PackageMode, Featured: item.Skill.Featured,
+		}
+		for _, included := range item.Skill.IncludedSkills {
+			req.Skill.IncludedSkills = append(req.Skill.IncludedSkills, SkillPackageItem{
+				ID: included.ID, Optional: included.Optional, SortOrder: included.SortOrder,
+			})
+		}
+	}
+	platformKeys := make([]string, 0, len(item.Platforms))
+	for key := range item.Platforms {
+		platformKeys = append(platformKeys, key)
+	}
+	sort.Strings(platformKeys)
+	if len(platformKeys) > 0 {
+		key := platformKeys[0]
+		for _, candidate := range platformKeys {
+			if candidate == "universal" {
+				key = candidate
+				break
+			}
+		}
+		platform := item.Platforms[key]
+		req.PlatformKey = key
+		req.Platform = &MarketPlatformSpec{
+			Key: key, Platform: platform.Platform, OS: platform.OS, Arch: platform.Arch,
+			Description: platform.Description, Readme: platform.Readme, MinDesktopVersion: platform.MinDesktopVersion,
+			Metadata: platform.Metadata, Dependencies: append([]MarketDependency(nil), platform.Dependencies...),
+			Install: platform.Install, Uninstall: platform.Uninstall, Detect: platform.Detect,
+		}
+	}
+	return req
 }
 
 func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *storedArtifact) error {
@@ -1110,26 +1235,74 @@ func replaceSubmissionTaxonomyTx(ctx context.Context, tx *sql.Tx, req PublishReq
 
 func pendingVersionCandidateTx(ctx context.Context, tx *sql.Tx, itemType ItemType, id string) (versionCandidate, error) {
 	var submission versionCandidate
-	var snapshotJSON, reviewedAt, submittedAt string
-	err := tx.QueryRowContext(ctx, `SELECT item_type, item_id, version, creator_id, snapshot_json, review_status, review_note, reviewed_by, reviewed_at, submitted_at
+	var snapshotJSON, reviewedAt, submittedAt, publishedAt string
+	err := tx.QueryRowContext(ctx, `SELECT item_type, item_id, version, creator_id, snapshot_json, review_status, review_note, reviewed_by, reviewed_at, submitted_at, published_at
 		FROM versions WHERE item_type = ? AND item_id = ? AND review_status = ? AND snapshot_json IS NOT NULL AND snapshot_json <> ''
 		ORDER BY submitted_at DESC LIMIT 1`,
 		itemType, id, ReviewStatusPending).Scan(&submission.ItemType, &submission.ItemID, &submission.Version, &submission.CreatorID, &snapshotJSON,
-		&submission.Status, &submission.ReviewNote, &submission.ReviewedBy, &reviewedAt, &submittedAt)
+		&submission.Status, &submission.ReviewNote, &submission.ReviewedBy, &reviewedAt, &submittedAt, &publishedAt)
 	if err != nil {
 		return versionCandidate{}, err
 	}
-	if err := decodeJSONText(snapshotJSON, &submission.Request); err != nil {
+	if err := decodeVersionSnapshot(&submission, snapshotJSON); err != nil {
 		return versionCandidate{}, err
 	}
-	submission.Request.CreatorID = submission.CreatorID
 	submission.ReviewedAt = parseTime(reviewedAt)
 	submission.SubmittedAt = parseTime(submittedAt)
+	submission.PublishedAt = parseTime(publishedAt)
 	submission.UpdatedAt = submission.SubmittedAt
 	return submission, nil
 }
 
+func versionCandidateByVersionTx(ctx context.Context, tx *sql.Tx, itemType ItemType, id, version string) (versionCandidate, error) {
+	var submission versionCandidate
+	var snapshotJSON sql.NullString
+	var reviewedAt, submittedAt, publishedAt string
+	err := tx.QueryRowContext(ctx, `SELECT item_type, item_id, version, creator_id, snapshot_json, review_status, review_note, reviewed_by, reviewed_at, submitted_at, published_at
+		FROM versions WHERE item_type = ? AND item_id = ? AND version = ?`, itemType, id, version).
+		Scan(&submission.ItemType, &submission.ItemID, &submission.Version, &submission.CreatorID, &snapshotJSON, &submission.Status,
+			&submission.ReviewNote, &submission.ReviewedBy, &reviewedAt, &submittedAt, &publishedAt)
+	if err != nil {
+		return versionCandidate{}, err
+	}
+	if !snapshotJSON.Valid || strings.TrimSpace(snapshotJSON.String) == "" {
+		return versionCandidate{}, fmt.Errorf("%w: %s/%s@%s", errVersionSnapshotMissing, itemType, id, version)
+	}
+	if err := decodeVersionSnapshot(&submission, snapshotJSON.String); err != nil {
+		return versionCandidate{}, err
+	}
+	submission.ReviewedAt = parseTime(reviewedAt)
+	submission.SubmittedAt = parseTime(submittedAt)
+	submission.PublishedAt = parseTime(publishedAt)
+	submission.UpdatedAt = submission.SubmittedAt
+	return submission, nil
+}
+
+func decodeVersionSnapshot(submission *versionCandidate, snapshotJSON string) error {
+	if err := decodeJSONText(snapshotJSON, &submission.Request); err != nil {
+		return fmt.Errorf("%w: invalid JSON for %s/%s@%s: %v", errVersionSnapshotMissing, submission.ItemType, submission.ItemID, submission.Version, err)
+	}
+	if submission.Request.Type != submission.ItemType || submission.Request.ID != submission.ItemID || canonicalVersion(submission.Request.Version) != canonicalVersion(submission.Version) || strings.TrimSpace(submission.Request.Name) == "" {
+		return fmt.Errorf("%w: identity mismatch for %s/%s@%s", errVersionSnapshotMissing, submission.ItemType, submission.ItemID, submission.Version)
+	}
+	submission.Request.Version = canonicalVersion(submission.Version)
+	submission.Request.CreatorID = submission.CreatorID
+	return nil
+}
+
 func applyApprovedVersionTx(ctx context.Context, tx *sql.Tx, submission versionCandidate, now, reviewer, note string) error {
+	return applyVersionSnapshotTx(ctx, tx, submission, versionActivation{
+		ReviewStatus: ReviewStatusApproved,
+		ReviewNote:   note,
+		ReviewedAt:   now,
+		ReviewedBy:   reviewer,
+		SubmittedAt:  submission.SubmittedAt.UTC().Format(time.RFC3339Nano),
+		PublishedAt:  now,
+		UpdatedAt:    now,
+	})
+}
+
+func applyVersionSnapshotTx(ctx context.Context, tx *sql.Tx, submission versionCandidate, activation versionActivation) error {
 	req := submission.Request
 	metadataJSON, err := encodeJSONText(storageMetadata(req.Metadata), "{}")
 	if err != nil {
@@ -1156,8 +1329,8 @@ func applyApprovedVersionTx(ctx context.Context, tx *sql.Tx, submission versionC
 		published = 1, submitted_at = excluded.submitted_at, published_at = excluded.published_at, updated_at = excluded.updated_at`
 	if _, err = tx.ExecContext(ctx, approvedUpsert,
 		req.Type, req.ID, req.Name, req.Description, req.Readme, req.Version, req.MinDesktopVersion, req.SandboxKind, req.WebsiteKind,
-		submission.CreatorID, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), ReviewStatusApproved, note,
-		now, reviewer, submission.SubmittedAt.UTC().Format(time.RFC3339Nano), now, now); err != nil {
+		submission.CreatorID, metadataJSON, dependenciesJSON, protocolJSON, strings.TrimSpace(req.ADPYAML), activation.ReviewStatus, activation.ReviewNote,
+		activation.ReviewedAt, activation.ReviewedBy, activation.SubmittedAt, activation.PublishedAt, activation.UpdatedAt); err != nil {
 		return err
 	}
 	return replaceSubmissionTaxonomyTx(ctx, tx, req)
@@ -1204,26 +1377,23 @@ func (s *Store) Unpublish(ctx context.Context, itemType ItemType, id, version st
 	if replacement == "" {
 		_, err = tx.ExecContext(ctx, `UPDATE items SET published = 0, updated_at = ? WHERE type = ? AND id = ?`, now, itemType, id)
 	} else {
-		_, err = tx.ExecContext(ctx, `UPDATE items SET
-			latest_version = ?, creator_id = (SELECT creator_id FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			description = (SELECT description FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			readme = (SELECT readme FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			metadata_json = (SELECT metadata_json FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			dependencies_json = (SELECT dependencies_json FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			protocol_json = (SELECT protocol_json FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			adp_yaml = (SELECT adp_yaml FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			review_status = (SELECT review_status FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			review_note = (SELECT review_note FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			reviewed_at = (SELECT reviewed_at FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			reviewed_by = (SELECT reviewed_by FROM versions WHERE item_type = ? AND item_id = ? AND version = ?),
-			published = 1, updated_at = ?
-			WHERE type = ? AND id = ?`,
-			replacement,
-			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
-			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
-			itemType, id, replacement, itemType, id, replacement, itemType, id, replacement,
-			itemType, id, replacement, itemType, id, replacement,
-			now, itemType, id)
+		candidate, candidateErr := versionCandidateByVersionTx(ctx, tx, itemType, id, replacement)
+		if candidateErr != nil {
+			return candidateErr
+		}
+		publishedAt := formatStoredTime(candidate.PublishedAt)
+		if publishedAt == "" {
+			publishedAt = formatStoredTime(candidate.SubmittedAt)
+		}
+		err = applyVersionSnapshotTx(ctx, tx, candidate, versionActivation{
+			ReviewStatus: ReviewStatusApproved,
+			ReviewNote:   candidate.ReviewNote,
+			ReviewedAt:   formatStoredTime(candidate.ReviewedAt),
+			ReviewedBy:   candidate.ReviewedBy,
+			SubmittedAt:  formatStoredTime(candidate.SubmittedAt),
+			PublishedAt:  publishedAt,
+			UpdatedAt:    now,
+		})
 	}
 	if err != nil {
 		return err
@@ -1649,21 +1819,21 @@ func (s *Store) GetAdminReviewDetail(ctx context.Context, itemType ItemType, id,
 
 func (s *Store) latestVersionCandidate(ctx context.Context, itemType ItemType, id string) (versionCandidate, error) {
 	var submission versionCandidate
-	var snapshotJSON, reviewedAt, submittedAt string
-	err := s.db.QueryRowContext(ctx, `SELECT item_type, item_id, version, creator_id, snapshot_json, review_status, review_note, reviewed_by, reviewed_at, submitted_at
+	var snapshotJSON, reviewedAt, submittedAt, publishedAt string
+	err := s.db.QueryRowContext(ctx, `SELECT item_type, item_id, version, creator_id, snapshot_json, review_status, review_note, reviewed_by, reviewed_at, submitted_at, published_at
 		FROM versions WHERE item_type = ? AND item_id = ? AND snapshot_json IS NOT NULL AND snapshot_json <> ''
 		ORDER BY (review_status = ?) DESC, submitted_at DESC LIMIT 1`, itemType, id, ReviewStatusPending).
 		Scan(&submission.ItemType, &submission.ItemID, &submission.Version, &submission.CreatorID, &snapshotJSON, &submission.Status,
-			&submission.ReviewNote, &submission.ReviewedBy, &reviewedAt, &submittedAt)
+			&submission.ReviewNote, &submission.ReviewedBy, &reviewedAt, &submittedAt, &publishedAt)
 	if err != nil {
 		return versionCandidate{}, err
 	}
-	if err := decodeJSONText(snapshotJSON, &submission.Request); err != nil {
+	if err := decodeVersionSnapshot(&submission, snapshotJSON); err != nil {
 		return versionCandidate{}, err
 	}
-	submission.Request.CreatorID = submission.CreatorID
 	submission.ReviewedAt = parseTime(reviewedAt)
 	submission.SubmittedAt = parseTime(submittedAt)
+	submission.PublishedAt = parseTime(publishedAt)
 	submission.UpdatedAt = submission.SubmittedAt
 	return submission, nil
 }
@@ -2797,6 +2967,13 @@ func parseTime(value string) time.Time {
 		return time.Time{}
 	}
 	return parsed
+}
+
+func formatStoredTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func normalizeItemType(value string) (ItemType, error) {

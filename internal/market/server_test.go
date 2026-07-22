@@ -3049,10 +3049,13 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 	app := newTestApp(t)
 	handler := app.Routes()
 	archive := zipArchive(t, map[string]string{"demo/SKILL.md": "# Demo\n"})
-	for _, version := range []string{"1.2.0", "1.10.0", "2.0.0"} {
-		publishMultipart(t, handler, PublishRequest{
-			Type: TypeSkill, ID: "rollback-demo", Name: "Rollback Demo", Version: version, ArchiveType: "zip",
-		}, archive)
+	fixtures := []PublishRequest{
+		{Type: TypeSkill, ID: "rollback-demo", Name: "Rollback 1.2", Version: "1.2.0", Description: "first release", Readme: "first readme", Tags: []string{"first"}, MinDesktopVersion: "1.0.0", ArchiveType: "zip", Metadata: map[string]string{"channel": "first"}, Skill: &SkillProfileSpec{Kind: SkillKindSingle, Category: "document", Scenario: "education", Level: "beginner"}},
+		{Type: TypeSkill, ID: "rollback-demo", Name: "Rollback 1.10", Version: "1.10.0", Description: "stable release", Readme: "stable readme", Tags: []string{"stable", "restored"}, MinDesktopVersion: "1.5.0", ArchiveType: "zip", Metadata: map[string]string{"channel": "stable"}, Skill: &SkillProfileSpec{Kind: SkillKindSingle, Category: "coding", Scenario: "developer", Level: "advanced", Featured: true}},
+		{Type: TypeSkill, ID: "rollback-demo", Name: "Rollback 2.0", Version: "2.0.0", Description: "latest release", Readme: "latest readme", Tags: []string{"latest"}, MinDesktopVersion: "2.0.0", ArchiveType: "zip", Metadata: map[string]string{"channel": "latest"}, Skill: &SkillProfileSpec{Kind: SkillKindSingle, Category: "automation", Scenario: "enterprise", Level: "intermediate"}},
+	}
+	for _, fixture := range fixtures {
+		publishMultipart(t, handler, fixture, archive)
 	}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo/resolve?version=2.0.0", nil)
@@ -3116,6 +3119,18 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 	if item.Version != "1.10.0" {
 		t.Fatalf("fallback version = %q, want 1.10.0", item.Version)
 	}
+	if item.Name != "Rollback 1.10" || item.Description != "stable release" || item.Readme != "stable readme" || item.MinDesktopVersion != "1.5.0" {
+		t.Fatalf("fallback base fields were not restored: %+v", item)
+	}
+	if strings.Join(item.Tags, ",") != "restored,stable" && strings.Join(item.Tags, ",") != "stable,restored" {
+		t.Fatalf("fallback tags = %v, want stable and restored", item.Tags)
+	}
+	if item.Metadata["channel"] != "stable" {
+		t.Fatalf("fallback metadata = %v, want stable channel", item.Metadata)
+	}
+	if item.Skill == nil || item.Skill.Category != "coding" || item.Skill.Scenario != "developer" || item.Skill.Level != "advanced" || !item.Skill.Featured {
+		t.Fatalf("fallback skill profile was not restored: %+v", item.Skill)
+	}
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/rollback-demo/resolve", nil)
@@ -3149,6 +3164,105 @@ func TestUnpublishLatestVersionFallsBackAndBlocksUnpublishedArtifacts(t *testing
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("last-version item status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBackfillCurrentVersionSnapshotPreservesLegacyCurrentRelease(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	publishMultipart(t, handler, PublishRequest{
+		Type: TypeSkill, ID: "legacy-current-snapshot", Name: "Legacy Current", Version: "1.0.0",
+		Description: "legacy description", Readme: "legacy readme", Tags: []string{"legacy", "current"},
+		MinDesktopVersion: "1.3.0", ArchiveType: "zip", Metadata: map[string]string{"source": "legacy"},
+		Skill: &SkillProfileSpec{Kind: SkillKindSingle, Category: "search", Scenario: "education", Level: "intermediate", Featured: true},
+	}, zipArchive(t, map[string]string{"legacy-current-snapshot/SKILL.md": "# Legacy\n"}))
+
+	if _, err := app.store.db.Exec(`UPDATE versions SET snapshot_json = NULL WHERE item_type = ? AND item_id = ? AND version = ?`, TypeSkill, "legacy-current-snapshot", "1.0.0"); err != nil {
+		t.Fatalf("clear snapshot: %v", err)
+	}
+	if err := app.store.backfillCurrentVersionSnapshots(context.Background()); err != nil {
+		t.Fatalf("backfillCurrentVersionSnapshots() error = %v", err)
+	}
+	var snapshotJSON string
+	if err := app.store.db.QueryRow(`SELECT snapshot_json FROM versions WHERE item_type = ? AND item_id = ? AND version = ?`, TypeSkill, "legacy-current-snapshot", "1.0.0").Scan(&snapshotJSON); err != nil {
+		t.Fatalf("query snapshot: %v", err)
+	}
+	var snapshot PublishRequest
+	if err := json.Unmarshal([]byte(snapshotJSON), &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if snapshot.Name != "Legacy Current" || snapshot.MinDesktopVersion != "1.3.0" || snapshot.Metadata["source"] != "legacy" {
+		t.Fatalf("backfilled snapshot base fields = %+v", snapshot)
+	}
+	if strings.Join(snapshot.Tags, ",") != "current,legacy" && strings.Join(snapshot.Tags, ",") != "legacy,current" {
+		t.Fatalf("backfilled snapshot tags = %v", snapshot.Tags)
+	}
+	if snapshot.Skill == nil || snapshot.Skill.Category != "search" || snapshot.Skill.Scenario != "education" || snapshot.Skill.Level != "intermediate" || !snapshot.Skill.Featured {
+		t.Fatalf("backfilled snapshot skill = %+v", snapshot.Skill)
+	}
+}
+
+func TestPublishRequestFromStoredItemPreservesRollbackFields(t *testing.T) {
+	item := storedItem{
+		Type: TypeSkill, ID: "snapshot-unit", Name: "Snapshot Unit", LatestVersion: "1.2.3",
+		Description: "description", Readme: "readme", Tags: []string{"one", "two"},
+		MinDesktopVersion: "1.4.0", CreatorID: "creator-a", Metadata: map[string]string{"channel": "stable"},
+		Dependencies: []MarketDependency{{Kind: DependencySkill, ID: "dependency-a", Required: true}},
+		Skill: &PublicSkillProfile{Kind: SkillKindPackage, Category: "coding", Scenario: "developer", Level: "advanced", PackageMode: SkillPackageModeCollection, Featured: true,
+			IncludedSkills: []PublicSkillPackageItem{{ID: "child-a", Optional: true, SortOrder: 2}}},
+		Platforms: map[string]PublicPlatform{"universal": {Platform: "universal", OS: "universal", Description: "platform description", Metadata: map[string]string{"platform": "all"}}},
+		ADPYAML:   "schema: 0.1\n", ReviewStatus: ReviewStatusApproved,
+	}
+	req := publishRequestFromStoredItem(item)
+	if req.Type != item.Type || req.ID != item.ID || req.Name != item.Name || req.Version != item.LatestVersion || req.MinDesktopVersion != item.MinDesktopVersion || req.CreatorID != item.CreatorID {
+		t.Fatalf("base fields were not preserved: %+v", req)
+	}
+	if req.Skill == nil || req.Skill.Kind != SkillKindPackage || len(req.Skill.IncludedSkills) != 1 || req.Skill.IncludedSkills[0].ID != "child-a" {
+		t.Fatalf("skill fields were not preserved: %+v", req.Skill)
+	}
+	if req.PlatformKey != "universal" || req.Platform == nil || req.Platform.Metadata["platform"] != "all" {
+		t.Fatalf("platform fields were not preserved: key=%q platform=%+v", req.PlatformKey, req.Platform)
+	}
+}
+
+func TestDecodeVersionSnapshotRejectsMismatchedIdentity(t *testing.T) {
+	submission := versionCandidate{ItemType: TypeSkill, ItemID: "expected", Version: "1.0.0", CreatorID: "creator-a"}
+	raw, err := json.Marshal(PublishRequest{Type: TypeSkill, ID: "different", Name: "Different", Version: "1.0.0"})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if err := decodeVersionSnapshot(&submission, string(raw)); !errors.Is(err, errVersionSnapshotMissing) {
+		t.Fatalf("decodeVersionSnapshot() error = %v, want errVersionSnapshotMissing", err)
+	}
+}
+
+func TestUnpublishRejectsIncompleteLegacyFallbackWithoutChangingCurrentRelease(t *testing.T) {
+	app := newTestApp(t)
+	handler := app.Routes()
+	archive := zipArchive(t, map[string]string{"legacy-fallback/SKILL.md": "# Legacy\n"})
+	publishMultipart(t, handler, PublishRequest{Type: TypeSkill, ID: "legacy-fallback", Name: "Legacy v1", Version: "1.0.0", ArchiveType: "zip", Tags: []string{"v1"}}, archive)
+	publishMultipart(t, handler, PublishRequest{Type: TypeSkill, ID: "legacy-fallback", Name: "Legacy v2", Version: "2.0.0", ArchiveType: "zip", Tags: []string{"v2"}}, archive)
+	if _, err := app.store.db.Exec(`UPDATE versions SET snapshot_json = NULL WHERE item_type = ? AND item_id = ? AND version = ?`, TypeSkill, "legacy-fallback", "1.0.0"); err != nil {
+		t.Fatalf("clear historical snapshot: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/unpublish", strings.NewReader(`{"type":"skill","id":"legacy-fallback","version":"2.0.0"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"code":"version_snapshot_incomplete"`) {
+		t.Fatalf("incomplete fallback status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var latest string
+	var currentPublished, latestPublished int
+	if err := app.store.db.QueryRow(`SELECT latest_version, published FROM items WHERE type = ? AND id = ?`, TypeSkill, "legacy-fallback").Scan(&latest, &currentPublished); err != nil {
+		t.Fatalf("query current item: %v", err)
+	}
+	if err := app.store.db.QueryRow(`SELECT published FROM versions WHERE item_type = ? AND item_id = ? AND version = ?`, TypeSkill, "legacy-fallback", "2.0.0").Scan(&latestPublished); err != nil {
+		t.Fatalf("query current version: %v", err)
+	}
+	if latest != "2.0.0" || currentPublished != 1 || latestPublished != 1 {
+		t.Fatalf("current release changed after rejected fallback: latest=%s itemPublished=%d versionPublished=%d", latest, currentPublished, latestPublished)
 	}
 }
 

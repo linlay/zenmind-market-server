@@ -1003,6 +1003,10 @@ func (a *App) handleUnpublish(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
+		if errors.Is(err, errVersionSnapshotMissing) {
+			writeError(w, http.StatusConflict, "version_snapshot_incomplete", "the fallback version predates complete release snapshots and cannot be safely restored")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
