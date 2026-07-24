@@ -1033,12 +1033,27 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 	if itemExists && existingCreatorID != "" && creatorID != "" && existingCreatorID != creatorID {
 		return errPublishForbidden
 	}
-	var pendingCount int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM versions WHERE item_type = ? AND item_id = ? AND review_status = ?`, req.Type, req.ID, ReviewStatusPending).Scan(&pendingCount); err != nil {
-		return err
+	var pendingVersion, pendingCreatorID string
+	pendingErr := tx.QueryRowContext(ctx, `SELECT version, creator_id FROM versions
+		WHERE item_type = ? AND item_id = ? AND review_status = ?
+		ORDER BY submitted_at DESC LIMIT 1`, req.Type, req.ID, ReviewStatusPending).Scan(&pendingVersion, &pendingCreatorID)
+	if pendingErr != nil && !errors.Is(pendingErr, sql.ErrNoRows) {
+		return pendingErr
 	}
-	if pendingCount > 0 {
-		return errPendingReleaseExists
+	if pendingErr == nil {
+		if canonicalVersion(pendingVersion) != req.Version ||
+			(pendingCreatorID != "" && creatorID != "" && pendingCreatorID != creatorID) {
+			return errPendingReleaseExists
+		}
+		var platformCount int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM version_platforms
+			WHERE item_type = ? AND item_id = ? AND version = ? AND platform_key = ?`,
+			req.Type, req.ID, req.Version, platform.Key).Scan(&platformCount); err != nil {
+			return err
+		}
+		if platformCount > 0 {
+			return errPublishedVersionExists
+		}
 	}
 	isUpdate := itemExists && activePublished == 1
 	if isUpdate {
@@ -1140,8 +1155,12 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest, artifact *store
 	return err
 }
 
-func (s *Store) ValidateRelease(ctx context.Context, itemType ItemType, id, version, creatorID string) error {
+func (s *Store) ValidateRelease(ctx context.Context, itemType ItemType, id, version, platformKey, creatorID string) error {
 	version = canonicalVersion(version)
+	platformKey = sanitizePlatform(platformKey)
+	if platformKey == "" {
+		platformKey = "universal"
+	}
 	var existingCreatorID, activeVersion string
 	var published int
 	err := s.db.QueryRowContext(ctx, `SELECT creator_id, latest_version, published FROM items WHERE type = ? AND id = ?`, itemType, id).
@@ -1160,12 +1179,28 @@ func (s *Store) ValidateRelease(ctx context.Context, itemType ItemType, id, vers
 			}
 		}
 	}
-	var pendingCount int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM versions WHERE item_type = ? AND item_id = ? AND review_status = ?`, itemType, id, ReviewStatusPending).Scan(&pendingCount); err != nil {
-		return err
+	var pendingVersion, pendingCreatorID string
+	pendingErr := s.db.QueryRowContext(ctx, `SELECT version, creator_id FROM versions
+		WHERE item_type = ? AND item_id = ? AND review_status = ?
+		ORDER BY submitted_at DESC LIMIT 1`, itemType, id, ReviewStatusPending).Scan(&pendingVersion, &pendingCreatorID)
+	if pendingErr != nil && !errors.Is(pendingErr, sql.ErrNoRows) {
+		return pendingErr
 	}
-	if pendingCount > 0 {
-		return errPendingReleaseExists
+	if pendingErr == nil {
+		if canonicalVersion(pendingVersion) != version ||
+			(pendingCreatorID != "" && strings.TrimSpace(creatorID) != "" && pendingCreatorID != strings.TrimSpace(creatorID)) {
+			return errPendingReleaseExists
+		}
+		var platformCount int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM version_platforms
+			WHERE item_type = ? AND item_id = ? AND version = ? AND platform_key = ?`,
+			itemType, id, version, platformKey).Scan(&platformCount); err != nil {
+			return err
+		}
+		if platformCount > 0 {
+			return errPublishedVersionExists
+		}
+		return nil
 	}
 	var versionPublished int
 	if err := s.db.QueryRowContext(ctx, `SELECT published FROM versions WHERE item_type = ? AND item_id = ? AND version = ?`, itemType, id, version).Scan(&versionPublished); err == nil && versionPublished == 1 {
@@ -2021,6 +2056,25 @@ func (s *Store) GetADPYAML(ctx context.Context, itemType ItemType, id, version s
 			AND v.published = 1 AND v.review_status = ? AND i.published = 1 AND i.review_status = ?`, itemType, id, version, ReviewStatusApproved, ReviewStatusApproved)
 	var value string
 	if err := row.Scan(&value); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", sql.ErrNoRows
+	}
+	return value, nil
+}
+
+// GetPublishADPYAML reads the in-progress release manifest so multiple
+// platform uploads can be merged before the release is approved.
+func (s *Store) GetPublishADPYAML(ctx context.Context, itemType ItemType, id, version string) (string, error) {
+	version = canonicalVersion(version)
+	if version == "" {
+		return "", sql.ErrNoRows
+	}
+	var value string
+	if err := s.db.QueryRowContext(ctx, `SELECT adp_yaml FROM versions
+		WHERE item_type = ? AND item_id = ? AND version = ?`,
+		itemType, id, version).Scan(&value); err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(value) == "" {

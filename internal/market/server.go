@@ -847,7 +847,7 @@ func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, f
 			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
 			return
 		}
-		if err := a.store.ValidateRelease(r.Context(), req.Type, req.ID, req.Version, creatorID); err != nil {
+		if err := a.store.ValidateRelease(r.Context(), req.Type, req.ID, req.Version, req.PlatformKey, creatorID); err != nil {
 			writePublishStoreError(w, err)
 			return
 		}
@@ -890,7 +890,7 @@ func (a *App) handlePublishWithOptions(w http.ResponseWriter, r *http.Request, f
 			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
 			return
 		}
-		if err := a.store.ValidateRelease(r.Context(), req.Type, req.ID, req.Version, creatorID); err != nil {
+		if err := a.store.ValidateRelease(r.Context(), req.Type, req.ID, req.Version, req.PlatformKey, creatorID); err != nil {
 			writePublishStoreError(w, err)
 			return
 		}

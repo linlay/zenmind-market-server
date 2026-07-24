@@ -100,7 +100,7 @@ func normalizePublishADP(ctx context.Context, store *Store, publicBaseURL string
 		return err
 	}
 	merged := current
-	if previousYAML, err := store.GetADPYAML(ctx, req.Type, req.ID, req.Version); err == nil && strings.TrimSpace(previousYAML) != "" {
+	if previousYAML, err := store.GetPublishADPYAML(ctx, req.Type, req.ID, req.Version); err == nil && strings.TrimSpace(previousYAML) != "" {
 		previous, err := parseADPDocument(previousYAML)
 		if err != nil {
 			return fmt.Errorf("stored adp.yaml is invalid: %w", err)

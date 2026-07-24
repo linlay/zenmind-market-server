@@ -2650,11 +2650,12 @@ func TestVersionPlatformsCarryPlatformSpecificProtocol(t *testing.T) {
 	handler := app.Routes()
 
 	publishMultipartAt(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
-		ID:          "zmctl",
-		Name:        "ZenMind CLI",
-		Version:     "1.0.0",
-		Description: "Global CLI description",
-		ArchiveType: "zip",
+		ID:           "zmctl",
+		Name:         "ZenMind CLI",
+		Version:      "1.0.0",
+		Description:  "Global CLI description",
+		ReviewStatus: ReviewStatusPending,
+		ArchiveType:  "zip",
 		Platform: &MarketPlatformSpec{
 			Key:               "darwin-arm64",
 			OS:                "darwin",
@@ -2740,18 +2741,20 @@ func TestResolvePlatformSpecFallsBackWithoutArtifact(t *testing.T) {
 	handler := app.Routes()
 
 	publishJSON(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
-		ID:      "json-cli",
-		Name:    "JSON CLI",
-		Version: "1.0.0",
+		ID:           "json-cli",
+		Name:         "JSON CLI",
+		Version:      "1.0.0",
+		ReviewStatus: ReviewStatusPending,
 		Platform: &MarketPlatformSpec{
 			Key:     "universal",
 			Install: &MarketScriptSpec{Command: "install universal"},
 		},
 	}, http.StatusOK)
 	publishJSON(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
-		ID:      "json-cli",
-		Name:    "JSON CLI",
-		Version: "1.0.0",
+		ID:           "json-cli",
+		Name:         "JSON CLI",
+		Version:      "1.0.0",
+		ReviewStatus: ReviewStatusPending,
 		Platform: &MarketPlatformSpec{
 			Key:     "linux",
 			Install: &MarketScriptSpec{Command: "install linux"},
@@ -2987,11 +2990,12 @@ func TestADPManifestPublishNormalizeAndEndpoint(t *testing.T) {
 	handler := app.Routes()
 
 	publishMultipartAt(t, handler, "/api/v1/admin/cli-tools/publish", PublishRequest{
-		ID:          "zmctl",
-		Name:        "ZenMind CLI",
-		Version:     "1.0.0",
-		Description: "CLI",
-		ArchiveType: "zip",
+		ID:           "zmctl",
+		Name:         "ZenMind CLI",
+		Version:      "1.0.0",
+		Description:  "CLI",
+		ReviewStatus: ReviewStatusPending,
+		ArchiveType:  "zip",
 		Platform: &MarketPlatformSpec{
 			Key:  "darwin-arm64",
 			OS:   "darwin",
