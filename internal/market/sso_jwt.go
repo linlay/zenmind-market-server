@@ -1,18 +1,16 @@
 package market
 
 import (
-	"crypto"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 var (
@@ -31,6 +29,14 @@ type ssoJWTVerifier struct {
 	issuer    string
 	audience  string
 	publicKey *rsa.PublicKey
+}
+
+type ssoJWTClaims struct {
+	UserID string `json:"user_id"`
+	Email  string `json:"email"`
+	Role   string `json:"role"`
+	Scope  string `json:"scope"`
+	jwt.RegisteredClaims
 }
 
 func newSSOJWTVerifier(cfg Config) (*ssoJWTVerifier, error) {
@@ -130,89 +136,40 @@ func bearerToken(header string) string {
 }
 
 func (v *ssoJWTVerifier) verify(token string, now time.Time) (ssoJWTPrincipal, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return ssoJWTPrincipal{}, errors.New("invalid JWT")
-	}
-	headerJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
+	claims := &ssoJWTClaims{}
+	parsed, err := jwt.ParseWithClaims(
+		token,
+		claims,
+		func(token *jwt.Token) (any, error) {
+			if token.Method != jwt.SigningMethodRS256 {
+				return nil, errors.New("unsupported JWT alg")
+			}
+			return v.publicKey, nil
+		},
+		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
+		jwt.WithIssuer(v.issuer),
+		jwt.WithAudience(v.audience),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithTimeFunc(func() time.Time { return now }),
+		jwt.WithLeeway(5*time.Second),
+	)
+	if err != nil || !parsed.Valid {
+		if err == nil {
+			err = errors.New("invalid JWT")
+		}
 		return ssoJWTPrincipal{}, err
 	}
-	var header map[string]any
-	if err := json.Unmarshal(headerJSON, &header); err != nil {
-		return ssoJWTPrincipal{}, err
+	if claims.IssuedAt == nil {
+		return ssoJWTPrincipal{}, errors.New("missing iat")
 	}
-	if header["alg"] != "RS256" {
-		return ssoJWTPrincipal{}, errors.New("unsupported JWT alg")
-	}
-	signedValue := parts[0] + "." + parts[1]
-	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil {
-		return ssoJWTPrincipal{}, err
-	}
-	digest := sha256.Sum256([]byte(signedValue))
-	if err := rsa.VerifyPKCS1v15(v.publicKey, crypto.SHA256, digest[:], signature); err != nil {
-		return ssoJWTPrincipal{}, err
-	}
-	claimsJSON, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ssoJWTPrincipal{}, err
-	}
-	var claims map[string]any
-	if err := json.Unmarshal(claimsJSON, &claims); err != nil {
-		return ssoJWTPrincipal{}, err
-	}
-	if readStringClaim(claims, "iss") != v.issuer {
-		return ssoJWTPrincipal{}, errors.New("issuer mismatch")
-	}
-	if !claimHasAudience(claims["aud"], v.audience) {
-		return ssoJWTPrincipal{}, errors.New("audience mismatch")
-	}
-	exp := readNumberClaim(claims, "exp")
-	if exp <= 0 || exp <= now.Unix() {
-		return ssoJWTPrincipal{}, errors.New("token expired")
-	}
-	userID := readStringClaim(claims, "user_id")
-	if userID == "" {
+	if strings.TrimSpace(claims.UserID) == "" {
 		return ssoJWTPrincipal{}, errors.New("missing user_id")
 	}
 	return ssoJWTPrincipal{
-		UserID: userID,
-		Email:  readStringClaim(claims, "email"),
-		Role:   strings.ToLower(readStringClaim(claims, "role")),
-		Scope:  readStringClaim(claims, "scope"),
+		UserID: strings.TrimSpace(claims.UserID),
+		Email:  strings.TrimSpace(claims.Email),
+		Role:   strings.ToLower(strings.TrimSpace(claims.Role)),
+		Scope:  strings.TrimSpace(claims.Scope),
 	}, nil
-}
-
-func readStringClaim(claims map[string]any, name string) string {
-	value, _ := claims[name].(string)
-	return strings.TrimSpace(value)
-}
-
-func readNumberClaim(claims map[string]any, name string) int64 {
-	switch value := claims[name].(type) {
-	case float64:
-		return int64(value)
-	case int64:
-		return value
-	case json.Number:
-		parsed, _ := value.Int64()
-		return parsed
-	default:
-		return 0
-	}
-}
-
-func claimHasAudience(value any, audience string) bool {
-	switch typed := value.(type) {
-	case string:
-		return typed == audience
-	case []any:
-		for _, item := range typed {
-			if item == audience {
-				return true
-			}
-		}
-	}
-	return false
 }

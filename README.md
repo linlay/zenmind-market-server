@@ -18,9 +18,9 @@ Default paths:
 - artifacts: `data/artifacts`
 - listen address: `:8088`
 
-Public catalog and component list APIs are readable without a token, including `/api/v1/catalog`, `/api/v1/desktop/catalog`, and typed market list/detail/resolve/download routes. Desktop user actions such as favorite/unfavorite accept an official-site SSO JWT with `aud=zenmind-market-server` and `scope` containing `market`.
+Public catalog and component list APIs are readable without a token, including `/api/v1/catalog`, `/api/v1/desktop/catalog`, and typed market list/detail/resolve/download routes. User actions such as favorite/unfavorite accept an official-site SSO JWT with `aud=market` and `scope` containing `market`. Browser requests receive this short-lived JWT only through the official-site gateway; Desktop uses its longer-lived multi-audience JWT.
 
-The market website auth flow is unchanged: it can continue to sit behind the official-site session flow or authentik gateway. Admin APIs keep accepting `Authorization: Bearer $MARKET_ADMIN_TOKEN` and trusted official proxy headers with `X-ZenMind-Market-Proxy-Token: $MARKET_PROXY_TOKEN`; they also accept official-site SSO JWTs with `role=admin` and `scope` containing `market`.
+The production website uses the official site's same-origin `/market/api/*` gateway. The gateway removes browser-supplied identity headers and injects a short-lived official JWT. Admin APIs keep the operational `MARKET_ADMIN_TOKEN` and trusted proxy headers only for internal CLI/rollback use; browser requests use official JWTs with `role=admin` and `scope` containing `market`.
 
 ## OIDC login
 
@@ -88,13 +88,13 @@ The server loads `.env` from the current working directory before building its r
 | `MARKET_S3_SECRET_ACCESS_KEY` | empty | Required secret key in `s3` mode. |
 | `MARKET_S3_SESSION_TOKEN` | empty | Optional temporary-credential session token. |
 | `MARKET_S3_PRESIGN_TTL` | `5m` | Lifetime of signed S3 download URLs; maximum 7 days. |
-| `MARKET_PUBLIC_BASE_URL` | `http://localhost:8088` | Public base URL used when generating artifact URLs. Use `https://market.zenmind.cc` in production. |
+| `MARKET_PUBLIC_BASE_URL` | `http://localhost:8088` | Public base URL used when generating artifact URLs. Use `https://www.zenmind.cc/market` in production. |
 | `MARKET_ADMIN_TOKEN` | empty | Bearer token required for admin APIs. |
 | `MARKET_PROXY_TOKEN` | empty | Trusted proxy header token. |
 | `SSO_JWT_ISSUER` | empty | Expected issuer for official-site SSO JWTs. Leave empty to disable JWT auth. |
 | `SSO_JWT_PUBLIC_KEY_FILE` | `configs/jwt-public.pem` | PEM public key file used to verify Desktop SSO JWTs. |
 | `SSO_JWT_PUBLIC_KEY_PEM` | empty | PEM public key value fallback; supports escaped `\n`. |
-| `SSO_JWT_AUDIENCE` | `zenmind-market-server` | Required JWT audience. |
+| `SSO_JWT_AUDIENCE` | `market` | Required JWT audience. |
 | `MARKET_MAX_UPLOAD_BYTES` | `536870912` | Maximum upload size in bytes. |
 
 Do not commit key material. Keep the official-site JWT public key in the ignored project-local file `configs/jwt-public.pem`, then mount `./configs` read-only in production.

@@ -14,7 +14,7 @@ services:
       SSO_JWT_ISSUER: ${SSO_JWT_ISSUER:-}
       SSO_JWT_PUBLIC_KEY_FILE: ${SSO_JWT_PUBLIC_KEY_FILE:-/configs/jwt-public.pem}
       SSO_JWT_PUBLIC_KEY_PEM: ${SSO_JWT_PUBLIC_KEY_PEM:-}
-      SSO_JWT_AUDIENCE: ${SSO_JWT_AUDIENCE:-zenmind-market-server}
+      SSO_JWT_AUDIENCE: ${SSO_JWT_AUDIENCE:-market}
       MARKET_MAX_UPLOAD_BYTES: ${MARKET_MAX_UPLOAD_BYTES:-536870912}
     volumes:
       - ./data:/data
