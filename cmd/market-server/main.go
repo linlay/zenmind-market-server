@@ -41,7 +41,7 @@ func main() {
 		SSOJWTIssuer:        strings.TrimSpace(os.Getenv("SSO_JWT_ISSUER")),
 		SSOJWTPublicKeyFile: envString("SSO_JWT_PUBLIC_KEY_FILE", defaultSSOJWTPublicKeyFile),
 		SSOJWTPublicKeyPEM:  strings.TrimSpace(os.Getenv("SSO_JWT_PUBLIC_KEY_PEM")),
-		SSOJWTAudience:      envString("SSO_JWT_AUDIENCE", "zenmind-market-server"),
+		SSOJWTAudience:      envString("SSO_JWT_AUDIENCE", "market"),
 		OIDCIssuer:          strings.TrimSpace(os.Getenv("MARKET_OIDC_ISSUER")),
 		OIDCClientID:        strings.TrimSpace(os.Getenv("MARKET_OIDC_CLIENT_ID")),
 		OIDCClientSecret:    strings.TrimSpace(os.Getenv("MARKET_OIDC_CLIENT_SECRET")),
