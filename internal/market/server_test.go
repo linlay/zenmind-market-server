@@ -1217,6 +1217,17 @@ func TestPublicReadEndpointsRemainAnonymous(t *testing.T) {
 		ArchiveType: "zip",
 	}, zipArchive(t, map[string]string{"anonymous-demo/SKILL.md": "# Anonymous\n"}))
 
+	var artifactURL string
+	if err := app.store.db.QueryRow(
+		`SELECT url FROM artifacts WHERE item_type = ? AND item_id = ? AND version = ? LIMIT 1`,
+		TypeSkill,
+		"anonymous-demo",
+		"1.0.0",
+	).Scan(&artifactURL); err != nil {
+		t.Fatalf("query published artifact URL: %v", err)
+	}
+	artifactPath := strings.TrimPrefix(artifactURL, "http://market.test")
+
 	cases := []struct {
 		path       string
 		wantStatus int
@@ -1230,8 +1241,8 @@ func TestPublicReadEndpointsRemainAnonymous(t *testing.T) {
 		{path: "/api/v1/skills/anonymous-demo/download", wantStatus: http.StatusUnauthorized},
 		{path: "/api/v1/skills/anonymous-demo/package/download", wantStatus: http.StatusUnauthorized},
 		{path: "/api/v1/adp/skill/anonymous-demo", wantStatus: http.StatusUnauthorized},
-		{path: "/npm/@zenmind-skill/anonymous-demo", wantStatus: http.StatusUnauthorized},
-		{path: "/artifacts/skill/anonymous-demo/1.0.0/artifact.zip", wantStatus: http.StatusUnauthorized},
+		{path: "/npm/@zenmind-skill/anonymous-demo", wantStatus: http.StatusOK},
+		{path: artifactPath, wantStatus: http.StatusOK},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()

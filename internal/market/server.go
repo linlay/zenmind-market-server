@@ -1018,9 +1018,6 @@ func (a *App) handleNPM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	if _, ok := a.authorizedMarketUser(w, r); !ok {
-		return
-	}
 	rawName := strings.TrimPrefix(r.URL.Path, "/npm/")
 	name, _ := url.PathUnescape(rawName)
 	itemType, id, err := parseNpmPackageName(name)
@@ -1048,9 +1045,6 @@ func (a *App) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !strings.HasPrefix(relative, "media/") {
-		if _, ok := a.authorizedMarketUser(w, r); !ok {
-			return
-		}
 		if err := a.store.EnsurePublishedArtifactPath(r.Context(), objectID); errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "not_found", "artifact not found")
 			return
